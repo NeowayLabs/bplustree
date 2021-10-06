@@ -1,0 +1,63 @@
+{
+  "root": {
+    "edges": [
+      {
+        "key": "0003",
+        "child": {
+          "edges": [
+            {
+              "key": "0002",
+              "child": {
+                "values": [
+                  { "key": "0002", "value": 2 }
+                ],
+                "lower_fence": null,
+                "upper_fence": "0002",
+                "sample_key": "0002"
+              }
+            }
+          ],
+          "upper_edge": {
+            "values": [
+              { "key": "0003", "value": 3 }
+            ],
+            "lower_fence": "0002",
+            "upper_fence": "0003",
+            "sample_key": "0003"
+          },
+          "lower_fence": null,
+          "upper_fence": "0003",
+          "sample_key": "0002"
+        }
+      }
+    ],
+    "upper_edge": {
+      "edges": [
+        {
+          "key": "0005",
+          "child": {
+            "values": [
+              { "key": "0005", "value": 5 }
+            ],
+            "lower_fence": "0003",
+            "upper_fence": "0005",
+            "sample_key": "0005"
+          }
+        }
+      ],
+      "upper_edge": {
+        "values": [],
+        "lower_fence": "0005",
+        "upper_fence": null,
+        "sample_key": "0006"
+      },
+      "lower_fence": "0003",
+      "upper_fence": null,
+      "sample_key": "0005"
+    },
+    "lower_fence": null,
+    "upper_fence": null,
+    "sample_key": "0003"
+  },
+  "height": 3
+}

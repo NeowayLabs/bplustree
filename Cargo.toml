@@ -1,0 +1,33 @@
+[package]
+name = "bplustree"
+version = "0.1.0"
+authors = ["André Guedes <andre.guedes@neoway.com.br>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+debug = true
+# panic = "abort"
+
+# [[bin]]
+# path = "src/main.rs"
+# name = "run"
+
+[features]
+default = []
+unwind-panic = []
+
+[dependencies]
+parking_lot = "0.11.1"
+parking_lot_core = "0.8.3"
+thiserror = "1"
+crossbeam-epoch = "0.9"
+smallvec = { version = "1.6", features = ["const_generics"]}
+backtrace = "0.3"
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+serial_test = "*"
