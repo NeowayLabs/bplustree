@@ -1,7 +1,7 @@
-use crate::{BPlusTree, Node, InternalNode, LeafNode, ParentHandler, Direction};
+use crate::{BPlusTree, Node, InternalNode, LeafNode};
 use crate::latch::HybridLatch;
 use smallvec::smallvec;
-use crossbeam_epoch::{self as epoch, Atomic};
+use crossbeam_epoch::Atomic;
 
 use serde::Deserialize;
 use std::sync::atomic::AtomicUsize;
@@ -91,10 +91,8 @@ fn translate_node(tree_node: TreeNode) -> Atomic<HybridLatch<DefaultNode<String,
 }
 
 pub fn sample_tree<P: AsRef<std::path::Path>>(path: P) -> BPlusTree<String, u64> {
-    use std::io::Read;
     let file = std::fs::File::open(path).expect("failed to find file");
     let tree: Tree = serde_json::from_reader(file).unwrap();
-    // println!("{:?}", tree);
     let translated = translate_node(tree.root);
     BPlusTree {
         root: HybridLatch::new(translated),

@@ -1,3 +1,20 @@
+//! Implementation of a fast in-memory concurrent B+ Tree featuring optimistic lock coupling. The implementation
+//! is based on [LeanStore](https://dbis1.github.io/leanstore.html) with some adaptations from
+//! [Umbra](https://umbra-db.com/#publications).
+//!
+//! The current API is very basic and more features are supposed to be added in the following
+//! versions, it tries to loosely follow the [`std::collections::BTreeMap`] API.
+//!
+//! Currently it is not heavily optimized but is already faster than some immutable concurrent lock-free
+//! implementations. Single threaded performance is generally slower (~ 1.4x) but still comparable to [`std::collections::BTreeMap`]
+//! with sligthly faster scans due to the B+ Tree topology.
+//! ```
+//! use bplustree::BPlusTree;
+//!
+//! let tree = BPlusTree::new();
+//!
+//! tree.insert("some", "data");
+//! ```
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use smallvec::{smallvec, SmallVec};
 
@@ -17,8 +34,13 @@ pub mod bench;
 
 use latch::{HybridLatch, OptimisticGuard, SharedGuard, ExclusiveGuard, HybridGuard};
 
+/// Type alias for the `GenericBPlusTree` with preset node sizes
 pub type BPlusTree<K, V> = GenericBPlusTree<K, V, 128, 256>;
 
+/// Concurrent, optimistically locked B+ Tree
+///
+/// `InnerNode` and `LeafNode` capacities can be configured through the const generic parameters `IC`
+/// and `LC` respectively.
 pub struct GenericBPlusTree<K, V, const IC: usize, const LC: usize> {
     root: HybridLatch<Atomic<HybridLatch<Node<K, V, IC, LC>>>>,
     height: AtomicUsize
@@ -48,6 +70,22 @@ macro_rules! tp {
 }
 
 impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V, IC, LC> {
+    /// Makes a new, empty `GenericBPlusTree`
+    ///
+    /// Allocates the root node on creation
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// // entries can now be inserted into the empty tree
+    /// tree.insert(1, "a");
+    /// ```
     pub fn new() -> Self {
         GenericBPlusTree {
             root: HybridLatch::new(Atomic::new(HybridLatch::new(Node::Leaf(
@@ -64,6 +102,7 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
         }
     }
 
+    /// Returns the height of the tree
     pub fn height(&self) -> usize {
         self.height.load(Ordering::Relaxed)
     }
@@ -630,6 +669,29 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
         }
     }
 
+    /// Zero copy optimistic getter for a value in the tree
+    ///
+    /// Accepts a function that may be executed multiple times until a valid access is performed,
+    /// calling the function should not have any side effects because it may be executed with
+    /// invalid data. When `lookup` returns it is guaranteed to have executed the function with
+    /// valid data at least once from which the result is returned.
+    ///
+    /// If no value exists for the specified key the received function may not be executed and `None`
+    /// is returned.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert("a", 1);
+    ///
+    /// assert_eq!(tree.lookup("a", |value| *value), Some(1));
+    /// ```
     pub fn lookup<Q, R, F>(&self, key: &Q, f: F) -> Option<R>
     where
         K: Borrow<Q> + Ord,
@@ -667,7 +729,51 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
         }
     }
 
-    pub fn remove<'t, 'k, Q>(&'t self, key: &'k Q) -> Option<(K, V)>
+    /// Removes a key from the tree, returning the value at the key if the key
+    /// was previously in the tree.
+    ///
+    /// The key may be any borrowed form of the tree's key type, but the ordering
+    /// on the borrowed form *must* match the ordering on the key type.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    /// tree.insert(1, "a");
+    /// assert_eq!(tree.remove(&1), Some("a"));
+    /// assert_eq!(tree.remove(&1), None);
+    /// ```
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q> + Ord,
+        Q: ?Sized + Ord
+    {
+        self.remove_entry(key).map(|(_, v)| v)
+    }
+
+    /// Removes a key from the tree, returning the stored key and value if the key
+    /// was previously in the tree.
+    ///
+    /// The key may be any borrowed form of the tree's key type, but the ordering
+    /// on the borrowed form *must* match the ordering on the key type.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    /// tree.insert(1, "a");
+    /// assert_eq!(tree.remove_entry(&1), Some((1, "a")));
+    /// assert_eq!(tree.remove_entry(&1), None);
+    /// ```
+    pub fn remove_entry<Q>(&self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q> + Ord,
         Q: ?Sized + Ord
@@ -707,6 +813,36 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
         };
 
         return opt;
+    }
+
+    /// Inserts a key-value pair into the tree.
+    ///
+    /// If the tree did not have this key present, `None` is returned.
+    ///
+    /// If the tree did have this key present, the value is updated, and the old
+    /// value is returned. The key is not updated, though; this matters for
+    /// types that can be `==` without being identical.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    /// assert_eq!(tree.insert(37, "a"), None);
+    ///
+    /// tree.insert(37, "b");
+    /// assert_eq!(tree.insert(37, "c"), Some("b"));
+    /// assert_eq!(tree.lookup(&37, |v| *v), Some("c"));
+    /// ```
+    pub fn insert(&self, key: K, value: V) -> Option<V>
+    where
+        K: Ord
+    {
+        let mut iter = self.raw_iter_mut();
+        iter.insert(key, value)
     }
 
     pub(crate) fn try_split<'t, 'g, 'e>(&'t self, needle: &OptimisticGuard<'g, Node<K, V, IC, LC>>, eg: &'e epoch::Guard) -> error::Result<()>
@@ -1085,6 +1221,49 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
         }
     }
 
+    /// Returns a raw iterator over the entries of the tree.
+    ///
+    /// Raw iterators do not implement the [`std::iter::Iterator`] trait,
+    /// instead they provide an API similar to RocksDB iterators
+    ///
+    /// Uses of this iterator should be short lived as it maintains the current
+    /// leaf locked in shared mode to provide fast scans. It is cheap to create a new iterator.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(1, "a");
+    /// tree.insert(2, "b");
+    /// tree.insert(3, "c");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_to_first();
+    /// assert_eq!(iter.next(), Some((&1, &"a")));
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    /// assert_eq!(iter.next(), Some((&3, &"c")));
+    /// assert_eq!(iter.next(), None);
+    ///
+    /// iter.seek_to_last();
+    /// assert_eq!(iter.prev(), Some((&3, &"c")));
+    /// assert_eq!(iter.prev(), Some((&2, &"b")));
+    /// assert_eq!(iter.prev(), Some((&1, &"a")));
+    ///
+    /// iter.seek(&2);
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    ///
+    /// iter.seek_for_prev(&2);
+    /// assert_eq!(iter.prev(), Some((&2, &"b")));
+    ///
+    /// // Drop this iterator as soon as possible to prevent blocking other threads
+    /// drop(iter);
+    /// ```
     pub fn raw_iter<'t>(&'t self) -> iter::RawSharedIter<'t, K, V, IC, LC>
     where
         K: Ord
@@ -1092,6 +1271,61 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
         iter::RawSharedIter::new(self)
     }
 
+    /// Returns a raw mutable iterator over the entries of the tree.
+    ///
+    /// Raw iterators do not implement the [`std::iter::Iterator`] trait,
+    /// instead they provide an API similar to RocksDB iterators
+    ///
+    /// This iterator is capable of perfoming mutations to the data structure, and it is
+    /// recommended for bulk insertion or removal of sorted data.
+    ///
+    /// Uses of this iterator should be short lived as it maintains the current
+    /// leaf locked in exclusive mode to provide fast scans and changes.
+    /// It is cheap to create a new iterator.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.insert(1, "a");
+    /// iter.insert(2, "b");
+    /// iter.insert(3, "c");
+    ///
+    /// iter.seek_to_first();
+    /// assert_eq!(iter.next(), Some((&1, &mut "a")));
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    /// assert_eq!(iter.next(), Some((&3, &mut "c")));
+    /// assert_eq!(iter.next(), None);
+    ///
+    /// iter.seek_to_first();
+    /// let (_k, v) = iter.next().unwrap();
+    /// *v = "A";
+    ///
+    /// iter.seek_to_last();
+    /// assert_eq!(iter.prev(), Some((&3, &mut "c")));
+    /// assert_eq!(iter.prev(), Some((&2, &mut "b")));
+    /// assert_eq!(iter.prev(), Some((&1, &mut "A")));
+    ///
+    /// iter.seek(&2);
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    ///
+    /// iter.remove(&1);
+    /// iter.remove(&2);
+    /// iter.remove(&3);
+    ///
+    /// iter.seek_to_first();
+    /// assert_eq!(iter.next(), None);
+    ///
+    /// // Drop this iterator as soon as possible to prevent blocking other threads
+    /// drop(iter);
+    /// ```
     pub fn raw_iter_mut<'t>(&'t self) -> iter::RawExclusiveIter<'t, K, V, IC, LC>
     where
         K: Ord
@@ -1099,9 +1333,27 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
         iter::RawExclusiveIter::new(self)
     }
 
+    /// Returns the number of elements in the tree.
+    ///
+    /// This is not executed on a snapshot of the data,
+    /// so it may be inconsistent in the presence of writers
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    /// assert_eq!(tree.len(), 0);
+    /// tree.insert(1, "a");
+    /// assert_eq!(tree.len(), 1);
+    /// ```
     pub fn len(&self) -> usize {
         let mut count = 0usize;
         let mut iter = self.raw_iter();
+        iter.seek_to_first();
         while let Some(_) = iter.next() {
             count += 1;
         }
@@ -1586,7 +1838,7 @@ impl<K, V, const INNER_CAPACITY: usize, const LC: usize> InternalNode<K, V, INNE
     }
 
     // OBS: Does not trigger merges or reassings upper_edge
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<Atomic<HybridLatch<Node<K, V, INNER_CAPACITY, LC>>>>
     where
         K: Borrow<Q> + Ord,
@@ -1662,17 +1914,14 @@ impl<K: Clone, V, const INNER_CAPACITY: usize, const LC: usize> InternalNode<K, 
 
 #[cfg(test)]
 mod tests {
-    use super::{GenericBPlusTree, Node, InternalNode, LeafNode, ParentHandler, Direction};
-    use super::latch::HybridLatch;
+    use super::{LeafNode, ParentHandler, Direction};
     use smallvec::smallvec;
-    use crossbeam_epoch::{self as epoch, Atomic};
+    use crossbeam_epoch::{self as epoch};
 
-    use serde::Deserialize;
-    use std::sync::atomic::AtomicUsize;
     use super::util::sample_tree;
 
     #[test]
-    fn sample_tree_works() {
+    fn sample_tree_lookup() {
         let bptree = sample_tree("fixtures/sample.json");
 
         let found = bptree.lookup("0003", |value| *value);
@@ -1700,10 +1949,10 @@ mod tests {
         let leaf = bptree.find_leaf("0002", eg).unwrap();
         assert_eq!(leaf.keys().first(), Some(&"0002".to_string()));
 
-        if let ParentHandler::Parent { parent_guard, pos } = bptree.find_parent(&leaf, eg).unwrap() {
+        if let ParentHandler::Parent { parent_guard, pos: _ } = bptree.find_parent(&leaf, eg).unwrap() {
             assert_eq!(parent_guard.as_internal().keys.first(), Some(&"0002".to_string()));
 
-            if let ParentHandler::Parent { parent_guard, pos } = bptree.find_parent(&parent_guard, eg).unwrap() {
+            if let ParentHandler::Parent { parent_guard, pos: _ } = bptree.find_parent(&parent_guard, eg).unwrap() {
                 assert_eq!(parent_guard.as_internal().keys.first(), Some(&"0003".to_string()));
 
                 if let ParentHandler::Root { tree_guard } = bptree.find_parent(&parent_guard, eg).unwrap() {
@@ -1721,7 +1970,7 @@ mod tests {
         let leaf = bptree.find_leaf("0005", eg).unwrap();
         assert_eq!(leaf.keys().first(), Some(&"0005".to_string()));
 
-        if let ParentHandler::Parent { parent_guard, pos } = bptree.find_parent(&leaf, eg).unwrap() {
+        if let ParentHandler::Parent { parent_guard, pos: _ } = bptree.find_parent(&leaf, eg).unwrap() {
             assert_eq!(parent_guard.as_internal().keys.first(), Some(&"0005".to_string()));
         } else {
             panic!("missing parent");
@@ -1737,29 +1986,29 @@ mod tests {
         let leaf = bptree.find_leaf("0002", eg).unwrap();
         assert_eq!(leaf.keys().first(), Some(&"0002".to_string()));
 
-        let (next_leaf, (parent, pos)) = bptree.find_nearest_leaf(&leaf, Direction::Forward, eg).unwrap().unwrap();
+        let (next_leaf, (parent, _pos)) = bptree.find_nearest_leaf(&leaf, Direction::Forward, eg).unwrap().unwrap();
         assert!(next_leaf.is_leaf());
         assert_eq!(next_leaf.keys().first(), Some(&"0003".to_string()));
         assert_eq!(parent.keys().first(), Some(&"0002".to_string()));
 
-        let (next_leaf, (parent, pos)) = bptree.find_nearest_leaf(&next_leaf, Direction::Forward, eg).unwrap().unwrap();
+        let (next_leaf, (parent, _pos)) = bptree.find_nearest_leaf(&next_leaf, Direction::Forward, eg).unwrap().unwrap();
         assert!(next_leaf.is_leaf());
         assert_eq!(next_leaf.keys().first(), Some(&"0005".to_string()));
         assert_eq!(parent.keys().first(), Some(&"0005".to_string()));
 
-        let (next_leaf, (parent, pos)) = bptree.find_nearest_leaf(&next_leaf, Direction::Reverse, eg).unwrap().unwrap();
+        let (next_leaf, (parent, _pos)) = bptree.find_nearest_leaf(&next_leaf, Direction::Reverse, eg).unwrap().unwrap();
         assert!(next_leaf.is_leaf());
         assert_eq!(next_leaf.keys().first(), Some(&"0003".to_string()));
         assert_eq!(parent.keys().first(), Some(&"0002".to_string()));
 
-        let (next_leaf, (parent, pos)) = bptree.find_nearest_leaf(&next_leaf, Direction::Reverse, eg).unwrap().unwrap();
+        let (next_leaf, (parent, _pos)) = bptree.find_nearest_leaf(&next_leaf, Direction::Reverse, eg).unwrap().unwrap();
         assert!(next_leaf.is_leaf());
         assert_eq!(next_leaf.keys().first(), Some(&"0002".to_string()));
         assert_eq!(parent.keys().first(), Some(&"0002".to_string()));
 
         assert!(bptree.find_nearest_leaf(&next_leaf, Direction::Reverse, eg).unwrap().is_none());
 
-        let (next_leaf, (parent, pos)) = bptree.find_nearest_leaf(&parent, Direction::Forward, eg).unwrap().unwrap();
+        let (next_leaf, (parent, _pos)) = bptree.find_nearest_leaf(&parent, Direction::Forward, eg).unwrap().unwrap();
         assert!(next_leaf.is_leaf());
         assert_eq!(next_leaf.keys().first(), Some(&"0005".to_string()));
         assert_eq!(parent.keys().first(), Some(&"0005".to_string()));

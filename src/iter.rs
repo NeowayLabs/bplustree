@@ -1,3 +1,4 @@
+//! Iterators for the `GenericBPlusTree` data structure
 use crate::{GenericBPlusTree, Node, Direction};
 use crate::latch::{SharedGuard, ExclusiveGuard, OptimisticGuard};
 use crossbeam_epoch::{self as epoch};
@@ -41,6 +42,8 @@ macro_rules! tp {
     };
 }
 
+
+/// Raw shared iterator over the entries of the tree.
 pub struct RawSharedIter<'t, K, V, const IC: usize, const LC: usize> {
     tree: &'t GenericBPlusTree<K, V, IC, LC>,
     eg: epoch::Guard,
@@ -49,7 +52,7 @@ pub struct RawSharedIter<'t, K, V, const IC: usize, const LC: usize> {
 }
 
 impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t, K, V, IC, LC> {
-    pub fn new(tree: &'t GenericBPlusTree<K, V, IC, LC>) -> RawSharedIter<'t, K, V, IC, LC> {
+    pub(crate) fn new(tree: &'t GenericBPlusTree<K, V, IC, LC>) -> RawSharedIter<'t, K, V, IC, LC> {
         RawSharedIter {
             tree,
             eg: epoch::pin(),
@@ -297,6 +300,35 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
         }
     }
 
+    /// Sets the iterator cursor immediately before the position for this key.
+    ///
+    /// Seeks to the position even though no value associated with the key exists on the tree.
+    ///
+    /// A subsequent call of [`RawSharedIter::next`] should return the entry associated with this key or the one
+    /// immediately following it.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek(&2);
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    ///
+    /// iter.seek(&1);
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    ///
+    /// iter.seek(&3);
+    /// assert_eq!(iter.next(), None);
+    /// ```
     pub fn seek<Q>(&mut self, key: &Q)
     where
         K: Borrow<Q> + Ord,
@@ -324,6 +356,35 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
         }
     }
 
+    /// Sets the iterator cursor immediately after the position for this key.
+    ///
+    /// Seeks to the position even though no value associated with the key exists on the tree.
+    ///
+    /// A subsequent call of [`RawSharedIter::prev`] should return the entry associated with this key or the one
+    /// immediately preceding it.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_for_prev(&2);
+    /// assert_eq!(iter.prev(), Some((&2, &"b")));
+    ///
+    /// iter.seek_for_prev(&3);
+    /// assert_eq!(iter.prev(), Some((&2, &"b")));
+    ///
+    /// iter.seek_for_prev(&1);
+    /// assert_eq!(iter.prev(), None);
+    /// ```
     pub fn seek_for_prev<Q>(&mut self, key: &Q)
     where
         K: Borrow<Q> + Ord,
@@ -357,6 +418,34 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
         }
     }
 
+    /// Sets the iterator cursor immediately before the position for this key, returning `true` if
+    /// the next entry matches the provided key.
+    ///
+    /// A subsequent call of [`RawSharedIter::next`] should return the entry associated with this
+    /// key if the method returned `true`.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// assert_eq!(iter.seek_exact(&2), true);
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    ///
+    /// assert_eq!(iter.seek_exact(&1), false);
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    ///
+    /// assert_eq!(iter.seek_exact(&3), false);
+    /// assert_eq!(iter.next(), None);
+    /// ```
     pub fn seek_exact<Q>(&mut self, key: &Q) -> bool
     where
         K: Borrow<Q> + Ord,
@@ -386,6 +475,33 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
         return exact;
     }
 
+    /// Sets the iterator cursor immediately before the position for the first key in the tree.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_to_first();
+    /// assert_eq!(iter.next(), None);
+    ///
+    /// // Calling insert on the tree while holding an iterator
+    /// // in the same thread may deadlock, so we drop here
+    /// drop(iter);
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_to_first();
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    /// ```
     pub fn seek_to_first(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
             Some((guard, _)) if guard.as_leaf().lower_fence.is_none() => {
@@ -402,6 +518,33 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
         self.parent = parent_opt;
     }
 
+    /// Sets the iterator cursor immediately after the position for the last key in the tree.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_to_last();
+    /// assert_eq!(iter.prev(), None);
+    ///
+    /// // Calling insert on the tree while holding an iterator
+    /// // in the same thread may deadlock, so we drop here
+    /// drop(iter);
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_to_last();
+    /// assert_eq!(iter.prev(), Some((&2, &"b")));
+    /// ```
     pub fn seek_to_last(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
             Some((guard, _)) if guard.as_leaf().upper_fence.is_none() => {
@@ -419,6 +562,29 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
         self.parent = parent_opt;
     }
 
+    /// Returns the next entry from the current cursor position.
+    ///
+    /// If the cursor was not seeked to any position this will always return `None`. This behavior
+    /// may change in the future.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_to_first();
+    ///
+    /// assert_eq!(iter.next(), Some((&2, &"b")));
+    /// assert_eq!(iter.next(), None);
+    /// ```
     #[inline]
     pub fn next(&mut self) -> Option<(&K, &V)> {
         loop {
@@ -471,6 +637,29 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
         }
     }
 
+    /// Returns the previous entry from the current cursor position.
+    ///
+    /// If the cursor was not seeked to any position this will always return `None`. This behavior
+    /// may change in the future.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter();
+    ///
+    /// iter.seek_to_last();
+    ///
+    /// assert_eq!(iter.prev(), Some((&2, &"b")));
+    /// assert_eq!(iter.prev(), None);
+    /// ```
     #[inline]
     pub fn prev(&mut self) -> Option<(&K, &V)> {
         loop {
@@ -542,6 +731,7 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawSharedIter<'t,
 //     true
 // }
 
+/// Raw exclusive iterator over the entries of the tree.
 pub struct RawExclusiveIter<'t, K, V, const IC: usize, const LC: usize> {
     tree: &'t GenericBPlusTree<K, V, IC, LC>,
     eg: epoch::Guard,
@@ -550,7 +740,7 @@ pub struct RawExclusiveIter<'t, K, V, const IC: usize, const LC: usize> {
 }
 
 impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<'t, K, V, IC, LC> {
-    pub fn new(tree: &'t GenericBPlusTree<K, V, IC, LC>) -> RawExclusiveIter<'t, K, V, IC, LC> {
+    pub(crate) fn new(tree: &'t GenericBPlusTree<K, V, IC, LC>) -> RawExclusiveIter<'t, K, V, IC, LC> {
         RawExclusiveIter {
             tree,
             eg: epoch::pin(),
@@ -798,6 +988,35 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         }
     }
 
+    /// Sets the iterator cursor immediately before the position for this key.
+    ///
+    /// Seeks to the position even though no value associated with the key exists on the tree.
+    ///
+    /// A subsequent call of [`RawExclusiveIter::next`] should return the entry associated with this key or the one
+    /// immediately following it.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.seek(&2);
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    ///
+    /// iter.seek(&1);
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    ///
+    /// iter.seek(&3);
+    /// assert_eq!(iter.next(), None);
+    /// ```
     pub fn seek<Q>(&mut self, key: &Q)
     where
         K: Borrow<Q> + Ord,
@@ -826,6 +1045,35 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         }
     }
 
+    /// Sets the iterator cursor immediately after the position for this key.
+    ///
+    /// Seeks to the position even though no value associated with the key exists on the tree.
+    ///
+    /// A subsequent call of [`RawExclusiveIter::prev`] should return the entry associated with this key or the one
+    /// immediately preceding it.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.seek_for_prev(&2);
+    /// assert_eq!(iter.prev(), Some((&2, &mut "b")));
+    ///
+    /// iter.seek_for_prev(&3);
+    /// assert_eq!(iter.prev(), Some((&2, &mut "b")));
+    ///
+    /// iter.seek_for_prev(&1);
+    /// assert_eq!(iter.prev(), None);
+    /// ```
     pub fn seek_for_prev<Q>(&mut self, key: &Q)
     where
         K: Borrow<Q> + Ord,
@@ -860,6 +1108,34 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         }
     }
 
+    /// Sets the iterator cursor immediately before the position for this key, returning `true` if
+    /// the next entry matches the provided key.
+    ///
+    /// A subsequent call of [`RawExclusiveIter::next`] should return the entry associated with this
+    /// key if the method returned `true`.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// assert_eq!(iter.seek_exact(&2), true);
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    ///
+    /// assert_eq!(iter.seek_exact(&1), false);
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    ///
+    /// assert_eq!(iter.seek_exact(&3), false);
+    /// assert_eq!(iter.next(), None);
+    /// ```
     pub fn seek_exact<Q>(&mut self, key: &Q) -> bool
     where
         K: Borrow<Q> + Ord,
@@ -890,6 +1166,27 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         return exact;
     }
 
+    /// Sets the iterator cursor immediately before the position for the first key in the tree.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.seek_to_first();
+    /// assert_eq!(iter.next(), None);
+    ///
+    /// iter.insert(2, "b");
+    ///
+    /// iter.seek_to_first();
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    /// ```
     pub fn seek_to_first(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
             Some((guard, _)) if guard.as_leaf().lower_fence.is_none() => {
@@ -906,6 +1203,27 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         self.parent = parent_opt;
     }
 
+    /// Sets the iterator cursor immediately after the position for the last key in the tree.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.seek_to_last();
+    /// assert_eq!(iter.prev(), None);
+    ///
+    /// iter.insert(2, "b");
+    ///
+    /// iter.seek_to_last();
+    /// assert_eq!(iter.prev(), Some((&2, &mut "b")));
+    /// ```
     pub fn seek_to_last(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
             Some((guard, _)) if guard.as_leaf().upper_fence.is_none() => {
@@ -923,12 +1241,32 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         self.parent = parent_opt;
     }
 
-    pub fn insert(&mut self, key: K, value: V) {
+    /// Inserts the key value pair in the tree.
+    ///
+    /// This method can be used to insert sorted pairs faster than using [`GenericBPlusTree::insert`].
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.insert(1, "a");
+    /// iter.insert(2, "b");
+    /// assert_eq!(iter.insert(3, "c"), None);
+    /// assert_eq!(iter.insert(3, "d"), Some("c"));
+    /// ```
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         'start: loop {
             if self.seek_exact(&key) {
                 let (_k, v) = self.next().unwrap();
-                *v = value;
-                break;
+                let old = std::mem::replace(v, value);
+                break Some(old);
             } else {
                 let (guard, cursor) = self.leaf.as_mut().expect("just seeked");
                 if guard.as_leaf().has_space() {
@@ -941,7 +1279,7 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
                             unreachable!("seek_exact always sets cursor to before");
                         }
                     }
-                    break;
+                    break None;
                 } else {
                     self.parent.take();
                     let (guard, _cursor) = self.leaf.take().expect("just seeked");
@@ -976,6 +1314,35 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         }
     }
 
+    /// Removes the entry associated with this key from the tree, returning it if
+    /// present.
+    ///
+    /// This method can be used to remove sorted entries faster than using [`GenericBPlusTree::remove`].
+    ///
+    /// This method is slower than [`GenericBPlusTree::remove`] when the requested
+    /// entry is not present in the tree, because it locks the leaf node exclusively before
+    /// checking the existence of the entry.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.insert(1, "a");
+    /// iter.insert(2, "b");
+    /// iter.insert(3, "c");
+    ///
+    /// assert_eq!(iter.remove(&1), Some((1, "a")));
+    /// assert_eq!(iter.remove(&2), Some((2, "b")));
+    /// assert_eq!(iter.remove(&3), Some((3, "c")));
+    /// assert_eq!(iter.remove(&4), None);
+    /// ```
     pub fn remove<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q> + Ord,
@@ -1052,6 +1419,29 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         }
     }
 
+    /// Returns the next entry from the current cursor position.
+    ///
+    /// If the cursor was not seeked to any position this will always return `None`. This behavior
+    /// may change in the future.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.seek_to_first();
+    ///
+    /// assert_eq!(iter.next(), Some((&2, &mut "b")));
+    /// assert_eq!(iter.next(), None);
+    /// ```
     #[inline]
     pub fn next(&mut self) -> Option<(&K, &mut V)> {
         loop {
@@ -1106,6 +1496,29 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
         }
     }
 
+    /// Returns the previous entry from the current cursor position.
+    ///
+    /// If the cursor was not seeked to any position this will always return `None`. This behavior
+    /// may change in the future.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use bplustree::BPlusTree;
+    ///
+    /// let tree = BPlusTree::new();
+    ///
+    /// tree.insert(2, "b");
+    ///
+    /// let mut iter = tree.raw_iter_mut();
+    ///
+    /// iter.seek_to_last();
+    ///
+    /// assert_eq!(iter.prev(), Some((&2, &mut "b")));
+    /// assert_eq!(iter.prev(), None);
+    /// ```
     #[inline]
     pub fn prev(&mut self) -> Option<(&K, &mut V)> {
         loop {
@@ -1167,7 +1580,7 @@ impl <'t, K: Clone + Ord, V, const IC: usize, const LC: usize> RawExclusiveIter<
 #[cfg(test)]
 mod tests {
     use crate::{BPlusTree};
-    use crossbeam_epoch::{self as epoch, Atomic};
+    use crossbeam_epoch::{self as epoch};
     use crate::util::sample_tree;
     use super::{RawSharedIter, RawExclusiveIter};
     use serial_test::serial;
@@ -1252,7 +1665,7 @@ mod tests {
         assert_eq!(iter.next(), kv_mut!(3));
 
         {
-            let (k, v) = iter.next().unwrap();
+            let (_k, v) = iter.next().unwrap();
             *v = 6;
         }
 
@@ -1279,7 +1692,7 @@ mod tests {
 
         iter.insert("0001".to_string(), 1);
 
-        iter.seek("");
+        iter.seek_to_first();
         assert_eq!(iter.next(), kv_mut!(1));
         assert_eq!(iter.next(), kv_mut!(2));
         assert_eq!(iter.next(), kv_mut!(3));
@@ -1320,7 +1733,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn exclusive_iter_remove() {
+    fn btree_map_sanity_check() {
         use rand::thread_rng;
         use rand::seq::SliceRandom;
 
@@ -1337,17 +1750,13 @@ mod tests {
 
         let mut data: Vec<_> = (0..n).collect();
 
-        let t0 = std::time::Instant::now();
         data.shuffle(&mut thread_rng());
-        println!("took: {:?}", t0.elapsed());
 
         let mut strings = vec!();
 
-        let t0 = std::time::Instant::now();
         for i in 0..n {
             strings.push(format!("{:09}", data[i]));
         }
-        println!("took: {:?}", t0.elapsed());
 
         let mut sorted_data = data.clone();
         sorted_data.sort();
@@ -1361,26 +1770,25 @@ mod tests {
         for i in 0..n {
             iter.insert(strings[i].clone(), data[i]);
         }
-        println!("took: {:?}", t0.elapsed());
+        println!("insert took: {:?}", t0.elapsed());
 
         let t0 = std::time::Instant::now();
-        iter.seek("");
-        println!("took: {:?}", t0.elapsed());
+        iter.seek_exact("");
+        println!("lookup took: {:?}", t0.elapsed());
 
         let t0 = std::time::Instant::now();
-        for mut i in 0..n {
+        for i in 0..n {
             assert_eq!(iter.next(), Some((&sorted_strings[i], &mut sorted_data[i])));
         }
-
         assert_eq!(iter.next(), None);
 
-        println!("took: {:?}", t0.elapsed());
+        println!("scan took: {:?}", t0.elapsed());
 
         let t0 = std::time::Instant::now();
-        for mut i in (0..n).rev() {
+        for i in (0..n).rev() {
             assert_eq!(iter.remove(&strings[i]).as_ref().map(|(k, v)| (k, v)), Some((&strings[i], &data[i])));
         }
-        println!("took: {:?}", t0.elapsed());
+        println!("remove took: {:?}", t0.elapsed());
 
         // let found = bptree.lookup("009999", |value| *value); // Caution, using this while holding the iterator may deadlock;
         // assert_eq!(found, None);
@@ -1391,7 +1799,7 @@ mod tests {
         while let Some(_) = iter.next() {
             count += 1;
         }
-        println!("took: {:?}", t0.elapsed());
+        println!("empty count took: {:?}", t0.elapsed());
 
         assert_eq!(count, 0);
 
@@ -1405,29 +1813,29 @@ mod tests {
         for i in 0..n {
             btreemap.insert(strings[i].clone(), data[i]);
         }
-        println!("took: {:?}", t0.elapsed());
+        println!("insert took: {:?}", t0.elapsed());
 
         let t0 = std::time::Instant::now();
         btreemap.contains_key("");
-        println!("took: {:?}", t0.elapsed());
+        println!("lookup took: {:?}", t0.elapsed());
 
         {
             let mut iter = btreemap.iter_mut();
             let t0 = std::time::Instant::now();
-            for mut i in 0..n {
+            for i in 0..n {
                 assert_eq!(iter.next(), Some((&sorted_strings[i], &mut sorted_data[i])));
             }
 
             assert_eq!(iter.next(), None);
 
-            println!("took: {:?}", t0.elapsed());
+            println!("scan took: {:?}", t0.elapsed());
         }
 
         let t0 = std::time::Instant::now();
-        for mut i in (0..n).rev() {
+        for i in (0..n).rev() {
             assert_eq!(btreemap.remove(&strings[i]).as_ref(), Some(&data[i]));
         }
-        println!("took: {:?}", t0.elapsed());
+        println!("remove took: {:?}", t0.elapsed());
 
         {
             let t0 = std::time::Instant::now();
@@ -1436,7 +1844,7 @@ mod tests {
             while let Some(_) = iter.next() {
                 count += 1;
             }
-            println!("took: {:?}", t0.elapsed());
+            println!("empty count took: {:?}", t0.elapsed());
 
             assert_eq!(count, 0);
         }

@@ -1,4 +1,4 @@
-//! Implementation of a hybrid latch based on the LeanStore paper
+//! Implementation of a hybrid latch based on the LeanStore paper.
 //!
 //! The key difference from a standard `RwLock` is the ability of acquiring optimistic read access
 //! without perfoming any writes to memory. This mode of access is called optimistic because it allows reads
@@ -545,8 +545,6 @@ mod tests {
     use std::cell::UnsafeCell;
     use std::sync::Arc;
     use std::thread;
-    use std::panic::{self, AssertUnwindSafe};
-    use parking_lot_core::SpinWait;
     use serial_test::serial;
 
     struct Wrapper<T>(UnsafeCell<[T; 1000]>);
@@ -555,22 +553,22 @@ mod tests {
 
     #[test]
     #[serial]
-    fn sync_works() {
+    fn single_threaded_reader_baseline() {
         let data = [1usize; 1000];
         let mut result = 1usize;
         let t0 = std::time::Instant::now();
-        for i in 0..4000000 {
+        for _i in 0..4000000 {
             for j in 0..1000 {
                 result = result.saturating_mul(data[j]);
             }
         }
-        println!("Sync reader done {:?}", t0.elapsed());
+        println!("Single threaded reader done in {:?}", t0.elapsed());
         assert!(result == 1);
     }
 
     #[test]
     #[serial]
-    fn concurrent_works() {
+    fn concurrent_reading_and_writing() {
         let data = Arc::new(Wrapper(UnsafeCell::new([1usize; 1000])));
         let latch = Arc::new(HybridLatch::new(()));
 
@@ -590,8 +588,7 @@ mod tests {
             let handle = thread::spawn(move || {
                 barrier.wait();
                 let mut result = 1usize;
-                for i in 0..4000000 {
-                    let mut spinwait = SpinWait::new();
+                for _i in 0..4000000 {
                     loop {
                         let res = {
                             let attempt = || {
@@ -611,7 +608,7 @@ mod tests {
                                 result *= v;
                                 break;
                             }
-                            Err(e) => {
+                            Err(_) => {
                                 // TODO maybe backoff;
                                 continue;
                             }
@@ -640,7 +637,7 @@ mod tests {
                 for _i in 0..(seconds * freq as f64) as usize {
                     thread::sleep(std::time::Duration::from_micros((micros_per_sec / freq) - critical));
                     {
-                        let locked = latch.exclusive();
+                        let _locked = latch.exclusive();
                         unsafe { (*data.0.get())[3] = 2 };
                         thread::sleep(std::time::Duration::from_micros(critical));
                         unsafe { (*data.0.get())[3] = 1 };
@@ -657,22 +654,22 @@ mod tests {
             handle.join().unwrap();
         }
 
-        println!("Readers done {:?}", t0.elapsed());
+        println!("Readers done in {:?}", t0.elapsed());
 
         for handle in writers {
             handle.join().unwrap();
         }
 
-        println!("Writers done {:?}", t0.elapsed());
+        println!("Writers done in at most {:?}", t0.elapsed());
     }
 
     #[test]
     #[serial]
-    fn sync_data_works() {
+    fn single_threaded_option_reader_baseline() {
         let data = [Some(1usize); 1000];
         let mut result = 1usize;
         let t0 = std::time::Instant::now();
-        for i in 0..4000000 {
+        for _i in 0..4000000 {
             for j in 0..1000 {
                 let opt = &data[j];
                 if let Some(n) = opt {
@@ -682,13 +679,13 @@ mod tests {
                 }
             }
         }
-        println!("Sync reader done {:?}", t0.elapsed());
+        println!("Single threaded option reader done in {:?}", t0.elapsed());
         assert!(result == 1);
     }
 
     #[test]
     #[serial]
-    fn concurrent_data_works() {
+    fn concurrent_option_reading_and_writing() {
         let data = Arc::new(Wrapper(UnsafeCell::new([Some(1usize); 1000])));
         let latch = Arc::new(HybridLatch::new(()));
 
@@ -708,8 +705,7 @@ mod tests {
             let handle = thread::spawn(move || {
                 barrier.wait();
                 let mut result = 1usize;
-                for i in 0..4000000 {
-                    let mut spinwait = SpinWait::new();
+                for _i in 0..4000000 {
                     loop {
                         let res = {
                             let attempt = || {
@@ -734,7 +730,7 @@ mod tests {
                                 result *= v;
                                 break;
                             }
-                            Err(e) => {
+                            Err(_) => {
                                 // TODO maybe backoff;
 
                                 continue;
@@ -764,7 +760,7 @@ mod tests {
                 for _i in 0..(seconds * freq as f64) as usize {
                     thread::sleep(std::time::Duration::from_micros((micros_per_sec / freq) - critical));
                     {
-                        let locked = latch.exclusive();
+                        let _locked = latch.exclusive();
                         unsafe { (*data.0.get())[3] = None };
                         thread::sleep(std::time::Duration::from_micros(critical));
                         unsafe { (*data.0.get())[3] = Some(1) };
@@ -781,12 +777,12 @@ mod tests {
             handle.join().unwrap();
         }
 
-        println!("Readers done {:?}", t0.elapsed());
+        println!("Readers done in {:?}", t0.elapsed());
 
         for handle in writers {
             handle.join().unwrap();
         }
 
-        println!("Writers done {:?}", t0.elapsed());
+        println!("Writers done in at most {:?}", t0.elapsed());
     }
 }
