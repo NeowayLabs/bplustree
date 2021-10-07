@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 description = "Concurrent in-memory B+ Tree featuring optimistic lock coupling"
 repository = "https://github.com/NeowayLabs/bplustree"
 
-keywords = ["b-tree", "b+tree", "tree", "concurrent", "map"]
+keywords = ["b-tree", "tree", "concurrent", "map"]
 categories = ["concurrency", "data-structures"]
 
 [dependencies]
