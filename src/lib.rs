@@ -5,7 +5,7 @@
 //! The current API is very basic and more features are supposed to be added in the following
 //! versions, it tries to loosely follow the [`std::collections::BTreeMap`] API.
 //!
-//! Currently it is not heavily optimized but is already faster than some immutable concurrent lock-free
+//! Currently it is not heavily optimized but is already faster than some concurrent lock-free
 //! implementations. Single threaded performance is generally slower (~ 1.4x) but still comparable to [`std::collections::BTreeMap`]
 //! with sligthly faster scans due to the B+ Tree topology.
 //! ```
