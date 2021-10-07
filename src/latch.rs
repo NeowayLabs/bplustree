@@ -171,7 +171,7 @@ impl<T> HybridLatch<T> {
     /// Optimistic access must be validated before performing any action based on a read of the
     /// underlying data. See [`OptimisticGuard::recheck`] for the details.
     ///
-    /// Acquiring shared access will may block the current thread. Reads from shared access do not
+    /// Acquiring shared access may block the current thread. Reads from shared access do not
     /// need to be validated.
     ///
     /// Returns either an [`OptimisticGuard`] or a [`SharedGuard`] through the [`OptimisticOrShared`] enum.
@@ -202,7 +202,7 @@ impl<T> HybridLatch<T> {
     /// Optimistic access must be validated before performing any action based on a read of the
     /// underlying data. See [`OptimisticGuard::recheck`] for the details.
     ///
-    /// Acquiring exclusive access will may block the current thread. Reads or writes from exclusive access do not
+    /// Acquiring exclusive access may block the current thread. Reads or writes from exclusive access do not
     /// need to be validated.
     ///
     /// Returns either an [`OptimisticGuard`] or an [`ExclusiveGuard`] through the [`OptimisticOrExclusive`] enum.
