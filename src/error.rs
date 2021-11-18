@@ -13,3 +13,18 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Error, Debug)]
+pub enum BufMgrError {
+    /// Requested size class is not a valid size class
+    #[error("requested size class is invalid")]
+    InvalidSizeClass,
+
+    /// Size class ran out of frames
+    #[error("the frames for the size class {0} were depleted")]
+    OutOfFrames(usize),
+
+    /// Io operation failed
+    #[error("io operation failed with {0}")]
+    Io(#[from] nix::Error)
+}

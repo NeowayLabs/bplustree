@@ -55,6 +55,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering}
 };
 use std::cell::UnsafeCell;
+use std::fmt;
 
 use crate::error;
 
@@ -79,7 +80,10 @@ impl<T> HybridLatch<T> {
             lock: RwLock::new(()),
         }
     }
+}
 
+
+impl<T: ?Sized> HybridLatch<T> {
     /// Locks this `HybridLatch` with exclusive write access, blocking the thread until it can be
     /// acquired.
     ///
@@ -91,7 +95,7 @@ impl<T> HybridLatch<T> {
         self.version.store(version, Ordering::Release);
         ExclusiveGuard {
             latch: self,
-            guard,
+            guard: Some(guard),
             data: self.data.get(),
             version
         }
@@ -107,10 +111,27 @@ impl<T> HybridLatch<T> {
         let version = self.version.load(Ordering::Relaxed);
         SharedGuard {
             latch: self,
-            guard,
+            guard: Some(guard),
             data: self.data.get(),
             version
         }
+    }
+
+    /// Attempts to acquire this `HybridLatch` with shared read access.
+    ///
+    /// If successful it returns an RAII guard which will release the shared access when dropped
+    ///
+    /// This function does not block, if the lock cannot be acquired it returns `None` instead.
+    #[inline]
+    pub fn try_shared(&self) -> Option<SharedGuard<'_, T>> {
+        let guard = self.lock.try_read()?;
+        let version = self.version.load(Ordering::Relaxed);
+        Some(SharedGuard {
+            latch: self,
+            guard: Some(guard),
+            data: self.data.get(),
+            version
+        })
     }
 
     /// Acquires optimistic read access from this `HybridLatch`, spinning until it can be acquired.
@@ -183,7 +204,7 @@ impl<T> HybridLatch<T> {
             let version = self.version.load(Ordering::Relaxed);
             OptimisticOrShared::Shared(SharedGuard {
                 latch: self,
-                guard,
+                guard: Some(guard),
                 data: self.data.get(),
                 version
             })
@@ -215,7 +236,7 @@ impl<T> HybridLatch<T> {
             self.version.store(version, Ordering::Release);
             OptimisticOrExclusive::Exclusive(ExclusiveGuard {
                 latch: self,
-                guard,
+                guard: Some(guard),
                 data: self.data.get(),
                 version
             })
@@ -229,15 +250,35 @@ impl<T> HybridLatch<T> {
     }
 }
 
-impl<T> std::convert::AsMut<T> for HybridLatch<T> {
+impl<T: ?Sized> std::convert::AsMut<T> for HybridLatch<T> {
     #[inline]
     fn as_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
 }
 
+impl<T: ?Sized + fmt::Debug> fmt::Debug for HybridLatch<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.try_shared() {
+            Some(guard) => f.debug_struct("HybridLatch").field("data", &&*guard).finish(),
+            None => {
+                struct LockedPlaceholder;
+                impl fmt::Debug for LockedPlaceholder {
+                    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("<locked>")
+                    }
+                }
+
+                f.debug_struct("HybridLatch")
+                    .field("data", &LockedPlaceholder)
+                    .finish()
+            }
+        }
+    }
+}
+
 /// Trait to allow using any guard when only read access is needed.
-pub trait HybridGuard<T: ?Sized> {
+pub trait HybridGuard<T: ?Sized, P: ?Sized = T> {
     /// Allows read access to the undelying data, which must be validated before any side effects
     fn inner(&self) -> &T;
 
@@ -250,19 +291,19 @@ pub trait HybridGuard<T: ?Sized> {
     fn recheck(&self) -> error::Result<()>;
 
     /// Returns a reference to the original `HybridLatch` struct
-    fn latch(&self) -> &HybridLatch<T>;
+    fn latch(&self) -> &HybridLatch<P>;
 }
 
 /// Structure used to perform optimistic accesses and validation.
-pub struct OptimisticGuard<'a, T: ?Sized> {
-    latch: &'a HybridLatch<T>,
+pub struct OptimisticGuard<'a, T: ?Sized, P: ?Sized = T> {
+    latch: &'a HybridLatch<P>,
     data: *const T,
     version: usize
 }
 
-unsafe impl<'a, T: ?Sized + Sync> Sync for OptimisticGuard<'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync, P: ?Sized + Sync> Sync for OptimisticGuard<'a, T, P> {}
 
-impl<'a, T> OptimisticGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> OptimisticGuard<'a, T, P> {
     /// Validates all previous optimistic accesses since the creation of the guard,
     /// if validation fails an [`error::Error::Unwind`] is returned to signal that the
     /// stack should be unwinded (by conditional returns) to a safe state.
@@ -279,7 +320,7 @@ impl<'a, T> OptimisticGuard<'a, T> {
     ///
     /// If validation fails it returns [`error::Error::Unwind`].
     #[inline]
-    pub fn to_exclusive(self) -> error::Result<ExclusiveGuard<'a, T>> {
+    pub fn to_exclusive(self) -> error::Result<ExclusiveGuard<'a, T, P>> {
         let new_version = self.version + 1;
         let expected = self.version;
         let locked = self.latch.lock.write();
@@ -296,7 +337,7 @@ impl<'a, T> OptimisticGuard<'a, T> {
 
         Ok(ExclusiveGuard {
             latch: self.latch,
-            guard: locked,
+            guard: Some(locked),
             data: self.data as *mut _,
             version: new_version
         })
@@ -307,7 +348,7 @@ impl<'a, T> OptimisticGuard<'a, T> {
     ///
     /// If validation fails it returns [`error::Error::Unwind`].
     #[inline]
-    pub fn to_shared(self) -> error::Result<SharedGuard<'a, T>> {
+    pub fn to_shared(self) -> error::Result<SharedGuard<'a, T, P>> {
         if let Some(guard) = self.latch.lock.try_read() {
             if self.version != self.latch.version.load(Ordering::Relaxed) {
                 return Err(error::Error::Unwind)
@@ -315,7 +356,7 @@ impl<'a, T> OptimisticGuard<'a, T> {
 
             Ok(SharedGuard {
                 latch: self.latch,
-                guard,
+                guard: Some(guard),
                 data: self.data,
                 version: self.version
             })
@@ -325,12 +366,39 @@ impl<'a, T> OptimisticGuard<'a, T> {
     }
 
     /// Returns a reference to the original `HybridLatch` struct
-    pub fn latch(&self) -> &'a HybridLatch<T> {
+    pub fn latch(&self) -> &'a HybridLatch<P> {
         self.latch
+    }
+
+    pub fn map<U: ?Sized, F>(s: Self, f: F) -> error::Result<OptimisticGuard<'a, U, P>>
+    where
+        F: FnOnce(&T) -> error::Result<&U>
+    {
+        let latch = s.latch;
+        let version = s.version;
+        let data = f(unsafe { &*s.data })?;
+        std::mem::forget(s);
+        Ok(OptimisticGuard {
+            latch,
+            version,
+            data
+        })
+    }
+
+    pub fn unmap(s: Self) -> OptimisticGuard<'a, P, P> {
+        let latch = s.latch;
+        let version = s.version;
+        let data = latch.data.get();
+        std::mem::forget(s);
+        OptimisticGuard {
+            latch,
+            version,
+            data
+        }
     }
 }
 
-impl<'a, T> std::ops::Deref for OptimisticGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> std::ops::Deref for OptimisticGuard<'a, T, P> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -338,30 +406,30 @@ impl<'a, T> std::ops::Deref for OptimisticGuard<'a, T> {
     }
 }
 
-impl<'a, T> HybridGuard<T> for OptimisticGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> HybridGuard<T, P> for OptimisticGuard<'a, T, P> {
     fn inner(&self) -> &T {
         self
     }
     fn recheck(&self) -> error::Result<()> {
         self.recheck()
     }
-    fn latch(&self) -> &HybridLatch<T> {
+    fn latch(&self) -> &HybridLatch<P> {
         self.latch()
     }
 }
 
 /// RAII structure used to release the exclusive write access of a latch when dropped.
-pub struct ExclusiveGuard<'a, T: ?Sized> {
-    latch: &'a HybridLatch<T>,
+pub struct ExclusiveGuard<'a, T: ?Sized, P: ?Sized = T> {
+    latch: &'a HybridLatch<P>,
     #[allow(dead_code)]
-    guard: RwLockWriteGuard<'a, ()>,
+    guard: Option<RwLockWriteGuard<'a, ()>>,
     data: *mut T,
     version: usize
 }
 
-unsafe impl<'a, T: ?Sized + Sync> Sync for ExclusiveGuard<'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync, P: ?Sized + Sync> Sync for ExclusiveGuard<'a, T, P> {}
 
-impl<'a, T> ExclusiveGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> ExclusiveGuard<'a, T, P> {
     /// A sanity assertion, exclusive guards do not need to be validated
     #[inline]
     pub fn recheck(&self) {
@@ -370,7 +438,7 @@ impl<'a, T> ExclusiveGuard<'a, T> {
 
     /// Unlocks the `HybridLatch` returning a [`OptimisticGuard`] in the current version
     #[inline]
-    pub fn unlock(self) -> OptimisticGuard<'a, T> {
+    pub fn unlock(self) -> OptimisticGuard<'a, T, P> {
         let new_version = self.version + 1;
         let latch = self.latch;
         let data = self.data;
@@ -384,12 +452,43 @@ impl<'a, T> ExclusiveGuard<'a, T> {
     }
 
     /// Returns a reference to the original `HybridLatch` struct
-    pub fn latch(&self) -> &'a HybridLatch<T> {
+    pub fn latch(&self) -> &'a HybridLatch<P> {
         self.latch
+    }
+
+    pub fn map<U: ?Sized, F>(mut s: Self, f: F) -> ExclusiveGuard<'a, U, P>
+    where
+        F: FnOnce(&mut T) -> &mut U
+    {
+        let latch = s.latch;
+        let version = s.version;
+        let guard = s.guard.take();
+        let data = f(unsafe { &mut *s.data });
+        std::mem::forget(s);
+        ExclusiveGuard {
+            latch,
+            version,
+            guard,
+            data
+        }
+    }
+
+    pub fn unmap(mut s: Self) -> ExclusiveGuard<'a, P, P> {
+        let latch = s.latch;
+        let version = s.version;
+        let guard = s.guard.take();
+        let data = latch.data.get();
+        std::mem::forget(s);
+        ExclusiveGuard {
+            latch,
+            version,
+            guard,
+            data
+        }
     }
 }
 
-impl<'a, T: ?Sized> Drop for ExclusiveGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> Drop for ExclusiveGuard<'a, T, P> {
     #[inline]
     fn drop(&mut self) {
         let new_version = self.version + 1;
@@ -397,7 +496,7 @@ impl<'a, T: ?Sized> Drop for ExclusiveGuard<'a, T> {
     }
 }
 
-impl<'a, T> std::ops::Deref for ExclusiveGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> std::ops::Deref for ExclusiveGuard<'a, T, P> {
     type Target = T;
 
     #[inline]
@@ -406,21 +505,27 @@ impl<'a, T> std::ops::Deref for ExclusiveGuard<'a, T> {
     }
 }
 
-impl<'a, T> std::ops::DerefMut for ExclusiveGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> std::ops::DerefMut for ExclusiveGuard<'a, T, P> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data }
     }
 }
 
-impl<'a, T> std::convert::AsMut<T> for ExclusiveGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> std::convert::AsMut<T> for ExclusiveGuard<'a, T, P> {
     #[inline]
     fn as_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data }
     }
 }
 
-impl<'a, T> HybridGuard<T> for ExclusiveGuard<'a, T> {
+impl<'a, T: ?Sized + fmt::Debug, P: ?Sized> fmt::Debug for ExclusiveGuard<'a, T, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<'a, T: ?Sized, P: ?Sized> HybridGuard<T, P> for ExclusiveGuard<'a, T, P> {
     fn inner(&self) -> &T {
         self
     }
@@ -428,23 +533,23 @@ impl<'a, T> HybridGuard<T> for ExclusiveGuard<'a, T> {
         self.recheck();
         Ok(())
     }
-    fn latch(&self) -> &HybridLatch<T> {
+    fn latch(&self) -> &HybridLatch<P> {
         self.latch()
     }
 }
 
 /// RAII structure used to release the shared read access of a latch when dropped.
-pub struct SharedGuard<'a, T: ?Sized> {
-    latch: &'a HybridLatch<T>,
+pub struct SharedGuard<'a, T: ?Sized, P: ?Sized = T> {
+    latch: &'a HybridLatch<P>,
     #[allow(dead_code)]
-    guard: RwLockReadGuard<'a, ()>,
+    guard: Option<RwLockReadGuard<'a, ()>>,
     data: *const T,
     version: usize
 }
 
-unsafe impl<'a, T: ?Sized + Sync> Sync for SharedGuard<'a, T> {}
+unsafe impl<'a, T: ?Sized + Sync, P: ?Sized + Sync> Sync for SharedGuard<'a, T, P> {}
 
-impl<'a, T> SharedGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> SharedGuard<'a, T, P> {
     /// A sanity assertion, exclusive guards do not need to be validated
     #[inline]
     pub fn recheck(&self) {
@@ -453,7 +558,7 @@ impl<'a, T> SharedGuard<'a, T> {
 
     /// Unlocks the `HybridLatch` returning a [`OptimisticGuard`] in the current version
     #[inline]
-    pub fn unlock(self) -> OptimisticGuard<'a, T> {
+    pub fn unlock(self) -> OptimisticGuard<'a, T, P> {
         OptimisticGuard {
             latch: self.latch,
             data: self.data,
@@ -463,7 +568,7 @@ impl<'a, T> SharedGuard<'a, T> {
 
     /// Returns a [`OptimisticGuard`] in the current version without consuming the original `SharedGuard`
     #[inline]
-    pub fn as_optimistic<'b>(&'b self) -> OptimisticGuard<'b, T> {
+    pub fn as_optimistic<'b>(&'b self) -> OptimisticGuard<'b, T, P> {
         OptimisticGuard {
             latch: self.latch,
             data: self.data,
@@ -472,12 +577,43 @@ impl<'a, T> SharedGuard<'a, T> {
     }
 
     /// Returns a reference to the original `HybridLatch` struct
-    pub fn latch(&self) -> &'a HybridLatch<T> {
+    pub fn latch(&self) -> &'a HybridLatch<P> {
         self.latch
+    }
+
+    pub fn map<U: ?Sized, F>(mut s: Self, f: F) -> SharedGuard<'a, U, P>
+    where
+        F: FnOnce(&T) -> &U
+    {
+        let latch = s.latch;
+        let version = s.version;
+        let guard = s.guard.take();
+        let data = f(unsafe { &*s.data });
+        std::mem::forget(s);
+        SharedGuard {
+            latch,
+            version,
+            guard,
+            data
+        }
+    }
+
+    pub fn unmap(mut s: Self) -> SharedGuard<'a, P, P> {
+        let latch = s.latch;
+        let version = s.version;
+        let guard = s.guard.take();
+        let data = latch.data.get();
+        std::mem::forget(s);
+        SharedGuard {
+            latch,
+            version,
+            guard,
+            data
+        }
     }
 }
 
-impl<'a, T> std::ops::Deref for SharedGuard<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> std::ops::Deref for SharedGuard<'a, T, P> {
     type Target = T;
 
     #[inline]
@@ -486,7 +622,13 @@ impl<'a, T> std::ops::Deref for SharedGuard<'a, T> {
     }
 }
 
-impl<'a, T> HybridGuard<T> for SharedGuard<'a, T> {
+impl<'a, T: ?Sized + fmt::Debug, P: ?Sized> fmt::Debug for SharedGuard<'a, T, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<'a, T: ?Sized, P: ?Sized> HybridGuard<T, P> for SharedGuard<'a, T, P> {
     fn inner(&self) -> &T {
         self
     }
@@ -494,18 +636,18 @@ impl<'a, T> HybridGuard<T> for SharedGuard<'a, T> {
         self.recheck();
         Ok(())
     }
-    fn latch(&self) -> &HybridLatch<T> {
+    fn latch(&self) -> &HybridLatch<P> {
         self.latch()
     }
 }
 
 /// Either an `OptimisticGuard` or a `SharedGuard`.
-pub enum OptimisticOrShared<'a, T> {
-    Optimistic(OptimisticGuard<'a, T>),
-    Shared(SharedGuard<'a, T>)
+pub enum OptimisticOrShared<'a, T: ?Sized, P: ?Sized = T> {
+    Optimistic(OptimisticGuard<'a, T, P>),
+    Shared(SharedGuard<'a, T, P>)
 }
 
-impl<'a, T> OptimisticOrShared<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> OptimisticOrShared<'a, T, P> {
     #[inline]
     pub fn recheck(&self) -> error::Result<()> {
         match self {
@@ -519,12 +661,12 @@ impl<'a, T> OptimisticOrShared<'a, T> {
 }
 
 /// Either an `OptimisticGuard` or an `ExclusiveGuard`.
-pub enum OptimisticOrExclusive<'a, T> {
-    Optimistic(OptimisticGuard<'a, T>),
-    Exclusive(ExclusiveGuard<'a, T>)
+pub enum OptimisticOrExclusive<'a, T: ?Sized, P: ?Sized = T> {
+    Optimistic(OptimisticGuard<'a, T, P>),
+    Exclusive(ExclusiveGuard<'a, T, P>)
 }
 
-impl<'a, T> OptimisticOrExclusive<'a, T> {
+impl<'a, T: ?Sized, P: ?Sized> OptimisticOrExclusive<'a, T, P> {
     #[inline]
     pub fn recheck(&self) -> error::Result<()> {
         match self {
@@ -536,7 +678,6 @@ impl<'a, T> OptimisticOrExclusive<'a, T> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
