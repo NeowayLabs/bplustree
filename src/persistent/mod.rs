@@ -11,6 +11,8 @@ mod tree;
 
 mod iter;
 
+// mod recovery;
+
 #[cfg(test)]
 mod bench;
 
@@ -29,10 +31,10 @@ use node::{
     Node
 };
 
-static BUFMGR: OnceCell<BufferManager<Node>> = OnceCell::new();
+static BUFMGR: OnceCell<BufferManager> = OnceCell::new();
 
 #[inline]
-pub fn bufmgr() -> &'static BufferManager<Node> {
+pub fn bufmgr() -> &'static BufferManager {
     unsafe { BUFMGR.get_unchecked() }
 }
 
@@ -43,7 +45,7 @@ pub fn setup_global_bufmgr<P: AsRef<std::path::Path>>(path: P, pool_size: usize)
             .create(true)
             .open(path)?;
 
-    BUFMGR.set(BufferManager::<Node>::new(file, pool_size)).expect("failed to set global");
+    BUFMGR.set(BufferManager::new(file, pool_size)).expect("failed to set global");
     bufmgr().init();
 
     Ok(())
@@ -59,7 +61,7 @@ pub(crate) fn ensure_global_bufmgr<P: AsRef<std::path::Path>>(path: P, pool_size
             .open(path)?;
 
         needs_init = true;
-        std::io::Result::Ok(BufferManager::<Node>::new(file, pool_size))
+        std::io::Result::Ok(BufferManager::new(file, pool_size))
     })?;
 
     if needs_init {

@@ -1,6 +1,6 @@
 use crate::tree::{PersistentBPlusTree, OptNodeGuard, ShrNodeGuard, ExvNodeGuard, Direction, swip_to_node_guard, bf_to_node_guard};
 use bplustree::latch::{OptimisticGuard, SharedGuard, ExclusiveGuard};
-use crate::error;
+use crate::error::{self, NonOptimisticExt};
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum Cursor {
@@ -43,7 +43,7 @@ impl <'t> RawSharedIter<'t> {
 
     fn next_leaf(&mut self) -> LeafResult {
         if let Some((guard, cursor)) = self.leaf.as_mut() {
-            if let Some(key) = guard.upper_fence().expect("not optimistic") {
+            if let Some(key) = guard.upper_fence().unopt() {
                 let next_key = [key, &[0]].concat().to_vec();
 
                 let _ = self.leaf.take(); // Drops leaf lock to try acquiring next (important)
@@ -68,7 +68,7 @@ impl <'t> RawSharedIter<'t> {
 
     fn prev_leaf(&mut self) -> LeafResult {
         if let Some((guard, cursor)) = self.leaf.as_mut() {
-            if let Some(key) = guard.lower_fence().expect("not optimistic") {
+            if let Some(key) = guard.lower_fence().unopt() {
                 let prev_key = key.to_vec();
 
                 let _ = self.leaf.take(); // Drops leaf lock to try acquiring next (important)
@@ -99,7 +99,7 @@ impl <'t> RawSharedIter<'t> {
                 _ => None
             };
             if let Some(pos) = bounded_pos {
-                let swip_guard = OptimisticGuard::map(parent_guard, |node| node.as_internal().edge_at(pos))?;
+                let swip_guard = OptimisticGuard::map(parent_guard, |node| node.try_internal()?.edge_at(pos))?;
                 let (swip_guard, guard) = PersistentBPlusTree::lock_coupling(swip_guard)?;
                 parent_guard = swip_to_node_guard(swip_guard);
 
@@ -126,7 +126,7 @@ impl <'t> RawSharedIter<'t> {
     pub fn leaf_for_key<K: AsRef<[u8]>>(&mut self, key: K) -> (ShrNodeGuard, Option<(OptNodeGuard, usize)>) {
         let key = key.as_ref();
         match self.leaf.take() {
-            Some((guard, _)) if guard.as_leaf().within_bounds(key).expect("not optimistic") => {
+            Some((guard, _)) if guard.as_leaf().within_bounds(key).unopt() => {
                 (guard, self.parent.take())
             }
             Some((guard, _)) => {
@@ -147,7 +147,7 @@ impl <'t> RawSharedIter<'t> {
 
         let leaf = guard.as_leaf();
         let leaf_len = leaf.base.len();
-        let (pos, _) = leaf.lower_bound(key).expect("not optimistic");
+        let (pos, _) = leaf.lower_bound(key).unopt();
         if pos >= leaf_len {
             self.leaf = Some((guard, Cursor::Before(leaf_len)));
             self.parent = parent_opt;
@@ -163,7 +163,7 @@ impl <'t> RawSharedIter<'t> {
 
         let leaf = guard.as_leaf();
         let leaf_len = leaf.base.len();
-        let (pos, exact) = leaf.lower_bound(key).expect("not optimistic");
+        let (pos, exact) = leaf.lower_bound(key).unopt();
         if exact {
             self.leaf = Some((guard, Cursor::After(pos)));
             self.parent = parent_opt;
@@ -185,7 +185,7 @@ impl <'t> RawSharedIter<'t> {
 
         let leaf = guard.as_leaf();
         let leaf_len = leaf.base.len();
-        let (pos, exact) = leaf.lower_bound(key).expect("not optimistic");
+        let (pos, exact) = leaf.lower_bound(key).unopt();
         if pos >= leaf_len {
             self.leaf = Some((guard, Cursor::Before(leaf_len)));
             self.parent = parent_opt;
@@ -199,7 +199,7 @@ impl <'t> RawSharedIter<'t> {
 
     pub fn seek_to_first(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
-            Some((guard, _)) if guard.lower_fence().expect("not optimistic").is_none() => {
+            Some((guard, _)) if guard.lower_fence().unopt().is_none() => {
                 (guard, self.parent.take())
             }
             Some((guard, _)) => {
@@ -219,7 +219,7 @@ impl <'t> RawSharedIter<'t> {
 
     pub fn seek_to_last(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
-            Some((guard, _)) if guard.upper_fence().expect("not optimistic").is_none() => {
+            Some((guard, _)) if guard.upper_fence().unopt().is_none() => {
                 (guard, self.parent.take())
             }
             Some((guard, _)) => {
@@ -272,8 +272,8 @@ impl <'t> RawSharedIter<'t> {
                 let (guard, cursor) = self.leaf.as_mut().unwrap();
                 let leaf = guard.as_leaf();
                 *cursor = new_cursor;
-                leaf.copy_full_key_at(curr_pos, &mut self.buffer).expect("not optimistic");
-                let value = leaf.value_at(curr_pos).expect("not optimistic");
+                leaf.copy_full_key_at(curr_pos, &mut self.buffer).unopt();
+                let value = leaf.value_at(curr_pos).unopt();
                 return Some((&self.buffer[..], value));
             } else {
                 match self.next_leaf() {
@@ -328,8 +328,8 @@ impl <'t> RawSharedIter<'t> {
                 let (guard, cursor) = self.leaf.as_mut().unwrap();
                 let leaf = guard.as_leaf();
                 *cursor = new_cursor;
-                leaf.copy_full_key_at(curr_pos, &mut self.buffer).expect("not optimistic");
-                let value = leaf.value_at(curr_pos).expect("not optimistic");
+                leaf.copy_full_key_at(curr_pos, &mut self.buffer).unopt();
+                let value = leaf.value_at(curr_pos).unopt();
                 return Some((&self.buffer[..], value));
             } else {
                 match self.prev_leaf() {
@@ -366,7 +366,7 @@ impl <'t> RawExclusiveIter<'t> {
 
     fn next_leaf(&mut self) -> LeafResult {
         if let Some((guard, cursor)) = self.leaf.as_mut() {
-            if let Some(key) = guard.upper_fence().expect("not optimistic") {
+            if let Some(key) = guard.upper_fence().unopt() {
                 let next_key = [key, &[0]].concat().to_vec();
 
                 let _ = self.leaf.take(); // Drops leaf lock to try acquiring next (important)
@@ -391,7 +391,7 @@ impl <'t> RawExclusiveIter<'t> {
 
     fn prev_leaf(&mut self) -> LeafResult {
         if let Some((guard, cursor)) = self.leaf.as_mut() {
-            if let Some(key) = guard.lower_fence().expect("not optimistic") {
+            if let Some(key) = guard.lower_fence().unopt() {
                 let prev_key = key.to_vec();
 
                 let _ = self.leaf.take(); // Drops leaf lock to try acquiring next (important)
@@ -422,7 +422,7 @@ impl <'t> RawExclusiveIter<'t> {
                 _ => None
             };
             if let Some(pos) = bounded_pos {
-                let swip_guard = OptimisticGuard::map(parent_guard, |node| node.as_internal().edge_at(pos))?;
+                let swip_guard = OptimisticGuard::map(parent_guard, |node| node.try_internal()?.edge_at(pos))?;
                 let (swip_guard, guard) = PersistentBPlusTree::lock_coupling(swip_guard)?;
                 parent_guard = swip_to_node_guard(swip_guard);
 
@@ -449,7 +449,7 @@ impl <'t> RawExclusiveIter<'t> {
     pub fn leaf_for_key<K: AsRef<[u8]>>(&mut self, key: K) -> (ExvNodeGuard, Option<(OptNodeGuard, usize)>) {
         let key = key.as_ref();
         match self.leaf.take() {
-            Some((guard, _)) if guard.as_leaf().within_bounds(key).expect("not optimistic") => {
+            Some((guard, _)) if guard.as_leaf().within_bounds(key).unopt() => {
                 (guard, self.parent.take())
             }
             Some((guard, _)) => {
@@ -472,7 +472,7 @@ impl <'t> RawExclusiveIter<'t> {
 
         let leaf = guard.as_leaf();
         let leaf_len = leaf.base.len();
-        let (pos, _) = leaf.lower_bound(key).expect("not optimistic");
+        let (pos, _) = leaf.lower_bound(key).unopt();
         if pos >= leaf_len {
             self.leaf = Some((guard, Cursor::Before(leaf_len)));
             self.parent = parent_opt;
@@ -488,7 +488,7 @@ impl <'t> RawExclusiveIter<'t> {
 
         let leaf = guard.as_leaf();
         let leaf_len = leaf.base.len();
-        let (pos, exact) = leaf.lower_bound(key).expect("not optimistic");
+        let (pos, exact) = leaf.lower_bound(key).unopt();
         if exact {
             self.leaf = Some((guard, Cursor::After(pos)));
             self.parent = parent_opt;
@@ -511,7 +511,7 @@ impl <'t> RawExclusiveIter<'t> {
 
         let leaf = guard.as_leaf();
         let leaf_len = leaf.base.len();
-        let (pos, exact) = leaf.lower_bound(key).expect("not optimistic");
+        let (pos, exact) = leaf.lower_bound(key).unopt();
         if pos >= leaf_len {
             self.leaf = Some((guard, Cursor::Before(leaf_len)));
             self.parent = parent_opt;
@@ -525,7 +525,7 @@ impl <'t> RawExclusiveIter<'t> {
 
     pub fn seek_to_first(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
-            Some((guard, _)) if guard.lower_fence().expect("not optimistic").is_none() => {
+            Some((guard, _)) if guard.lower_fence().unopt().is_none() => {
                 (guard, self.parent.take())
             }
             Some((guard, _)) => {
@@ -545,7 +545,7 @@ impl <'t> RawExclusiveIter<'t> {
 
     pub fn seek_to_last(&mut self) {
         let (guard, parent_opt) = match self.leaf.take() {
-            Some((guard, _)) if guard.upper_fence().expect("not optimistic").is_none() => {
+            Some((guard, _)) if guard.upper_fence().unopt().is_none() => {
                 (guard, self.parent.take())
             }
             Some((guard, _)) => {
@@ -604,7 +604,7 @@ impl <'t> RawExclusiveIter<'t> {
                 // println!("curr_pos: {}", curr_pos);
                 // println!("key: {:?}", leaf.key_at(curr_pos).unwrap());
                 // println!("fullkey: {:?}", leaf.full_key_at(curr_pos).unwrap());
-                leaf.copy_full_key_at(curr_pos, &mut self.buffer).expect("not optimistic");
+                leaf.copy_full_key_at(curr_pos, &mut self.buffer).unopt();
                 let value = leaf.value_at_mut(curr_pos);
                 return Some((&self.buffer[..], value));
             } else {
@@ -660,7 +660,7 @@ impl <'t> RawExclusiveIter<'t> {
                 let (guard, cursor) = self.leaf.as_mut().unwrap();
                 let leaf = guard.as_leaf_mut();
                 *cursor = new_cursor;
-                leaf.copy_full_key_at(curr_pos, &mut self.buffer).expect("not optimistic");
+                leaf.copy_full_key_at(curr_pos, &mut self.buffer).unopt();
                 let value = leaf.value_at_mut(curr_pos);
                 return Some((&self.buffer[..], value));
             } else {
@@ -683,7 +683,7 @@ impl <'t> RawExclusiveIter<'t> {
         'start: loop {
             if self.seek_exact(key) {
                 let leaf = self.leaf.as_mut().expect("seeked").0.as_leaf_mut();
-                let (pos, exact) = leaf.lower_bound(key).expect("not optimistic");
+                let (pos, exact) = leaf.lower_bound(key).unopt();
                 let payload = leaf.value_at_mut(pos);
                 if payload.len() == value.len() { // TODO optimize for <= value.len() (shorten_payload)
                     payload.copy_from_slice(value);
@@ -693,7 +693,7 @@ impl <'t> RawExclusiveIter<'t> {
                     continue 'start;
                 }
                 // println!("{:?}", leaf.base);
-                // println!("{:?} {:?}", key, leaf.full_key_at(pos).expect("not optimistic").as_slice());
+                // println!("{:?} {:?}", key, leaf.full_key_at(pos).unopt().as_slice());
                 // todo!("replace");
                 // let (_k, v) = self.next().unwrap();
                 // let old = std::mem::replace(v, value);
@@ -735,8 +735,9 @@ impl <'t> RawExclusiveIter<'t> {
                                 continue 'start;
                             }
                             Err(_) => {
-                                guard = bf_to_node_guard(guard.latch().optimistic_or_spin());
-                                continue
+                                // FIXME test this
+                                // guard = bf_to_node_guard(guard.latch().optimistic_or_spin());
+                                continue 'start;
                             }
                         }
                     }
@@ -766,7 +767,7 @@ impl <'t> RawExclusiveIter<'t> {
                     Cursor::Before(pos) => {
                         let curr_pos = pos;
                         if curr_pos < leaf.base.len() {
-                            leaf.copy_full_key_at(curr_pos, &mut self.buffer).expect("not optimistic");
+                            leaf.copy_full_key_at(curr_pos, &mut self.buffer).unopt();
                             leaf.remove_at(curr_pos);
                             Some(&self.buffer[..])
                         } else {
@@ -776,7 +777,7 @@ impl <'t> RawExclusiveIter<'t> {
                     Cursor::After(pos) => {
                         let curr_pos = pos + 1;
                         if curr_pos < leaf.base.len() {
-                            leaf.copy_full_key_at(curr_pos, &mut self.buffer).expect("not optimistic");
+                            leaf.copy_full_key_at(curr_pos, &mut self.buffer).unopt();
                             leaf.remove_at(curr_pos);
                             Some(&self.buffer[..])
                         } else {
@@ -812,8 +813,8 @@ impl <'t> RawExclusiveIter<'t> {
                                 }
                             }
                         }
-
-                        self.seek(removed_key.to_vec());
+                        let removed_owned = removed_key.to_vec();
+                        self.seek(removed_owned);
                     }
                 }
 
@@ -850,7 +851,7 @@ mod tests {
     #[serial]
     fn persistent_iter_test() {
         ensure_global_bufmgr("/tmp/state.db", 1 * 1024 * 1024).unwrap();
-        let tree = PersistentBPlusTree::new();
+        let tree = PersistentBPlusTree::new_registered();
         let mut iter = RawExclusiveIter::new(&tree);
         iter.insert([1], [1]);
         iter.seek_to_first();
@@ -871,7 +872,7 @@ mod tests {
 
         ensure_global_bufmgr("/tmp/state.db", 100 * 1024 * 1024).unwrap();
 
-        let bptree = PersistentBPlusTree::new();
+        let bptree = PersistentBPlusTree::new_registered();
 
         let mut iter = RawExclusiveIter::new(&bptree);
 

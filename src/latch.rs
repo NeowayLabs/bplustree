@@ -101,6 +101,11 @@ impl<T: ?Sized> HybridLatch<T> {
         }
     }
 
+    #[inline]
+    pub fn is_exclusively_latched(&self) -> bool {
+        (self.version.load(Ordering::Acquire) & 1) == 1
+    }
+
     /// Locks this `HybridLatch` with shared read access, blocking the thread until it can be
     /// acquired.
     ///
@@ -282,6 +287,9 @@ pub trait HybridGuard<T: ?Sized, P: ?Sized = T> {
     /// Allows read access to the undelying data, which must be validated before any side effects
     fn inner(&self) -> &T;
 
+    /// Allows read access to the unmapped data, which must be validated before any side effects
+    fn as_unmapped(&self) -> &P;
+
     /// Validates any accesses performed.
     ///
     /// The user of a `HybridGuard` must validate all accesses because there is no guarantee of which
@@ -309,6 +317,7 @@ impl<'a, T: ?Sized, P: ?Sized> OptimisticGuard<'a, T, P> {
     /// stack should be unwinded (by conditional returns) to a safe state.
     #[inline]
     pub fn recheck(&self) -> error::Result<()> {
+        debug_assert!((self.version & 1) == 0);
         if self.version != self.latch.version.load(Ordering::Acquire) {
             return Err(error::Error::Unwind)
         }
@@ -331,6 +340,31 @@ impl<'a, T: ?Sized, P: ?Sized> OptimisticGuard<'a, T, P> {
                 Ordering::Acquire,
                 Ordering::Acquire).is_err()
         {
+            drop(locked);
+            return Err(error::Error::Unwind)
+        }
+
+        Ok(ExclusiveGuard {
+            latch: self.latch,
+            guard: Some(locked),
+            data: self.data as *mut _,
+            version: new_version
+        })
+    }
+
+    #[inline]
+    pub fn to_exclusive_test(self) -> error::Result<ExclusiveGuard<'a, T, P>> {
+        let new_version = self.version + 1;
+        let expected = self.version;
+        let locked = self.latch.lock.write();
+        if self.latch.version
+            .compare_exchange(
+                expected,
+                new_version,
+                Ordering::Acquire,
+                Ordering::Acquire).is_err()
+        {
+            // println!("got latch but version mismatch");
             drop(locked);
             return Err(error::Error::Unwind)
         }
@@ -409,6 +443,9 @@ impl<'a, T: ?Sized, P: ?Sized> std::ops::Deref for OptimisticGuard<'a, T, P> {
 impl<'a, T: ?Sized, P: ?Sized> HybridGuard<T, P> for OptimisticGuard<'a, T, P> {
     fn inner(&self) -> &T {
         self
+    }
+    fn as_unmapped(&self) -> &P {
+        unsafe { &*self.latch().data.get() }
     }
     fn recheck(&self) -> error::Result<()> {
         self.recheck()
@@ -529,6 +566,9 @@ impl<'a, T: ?Sized, P: ?Sized> HybridGuard<T, P> for ExclusiveGuard<'a, T, P> {
     fn inner(&self) -> &T {
         self
     }
+    fn as_unmapped(&self) -> &P {
+        unsafe { &*self.latch().data.get() }
+    }
     fn recheck(&self) -> error::Result<()> {
         self.recheck();
         Ok(())
@@ -631,6 +671,9 @@ impl<'a, T: ?Sized + fmt::Debug, P: ?Sized> fmt::Debug for SharedGuard<'a, T, P>
 impl<'a, T: ?Sized, P: ?Sized> HybridGuard<T, P> for SharedGuard<'a, T, P> {
     fn inner(&self) -> &T {
         self
+    }
+    fn as_unmapped(&self) -> &P {
+        unsafe { &*self.latch().data.get() }
     }
     fn recheck(&self) -> error::Result<()> {
         self.recheck();

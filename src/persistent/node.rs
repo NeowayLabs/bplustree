@@ -7,14 +7,14 @@ use crate::bufmgr::{
 };
 
 use bplustree::{
-    error,
+    error::{self, NonOptimisticExt},
     latch::HybridLatch
 };
 
 
 #[derive(Default, PartialEq, Hash, Copy, Clone)]
 #[repr(C)]
-struct Data;
+pub(crate) struct Data; // TODO private
 
 #[derive(Default, PartialEq, Hash, Copy, Clone)]
 #[repr(C)]
@@ -63,6 +63,11 @@ impl std::ops::DerefMut for BoxedNode {
 
 const HINT_COUNT: usize = 16;
 
+fn to_u64(slice: &[u8]) -> u64 {
+    use std::convert::TryInto;
+    u64::from_be_bytes(slice.try_into().unwrap()) // FIXME debug
+}
+
 pub enum NodeKind<L, I> {
     Leaf(L),
     Internal(I)
@@ -78,9 +83,9 @@ pub struct Node {
     prefix_len: usize,
     lower_fence: Fence,
     upper_fence: Fence,
-    upper_edge: Option<Swip<HybridLatch<BufferFrame<Node>>>>,
+    upper_edge: Option<Swip<HybridLatch<BufferFrame>>>,
     hints: [u32; HINT_COUNT],
-    data: Data // Data starts at `addr_of(self.data)` and ends at `addr_of(self.data) + self.capacity`
+    data: Data // Data starts at `addr_of(self.data)` and ends at `addr_of(self.data) + self.capacity` // TODO private
 }
 
 impl Node {
@@ -135,6 +140,24 @@ impl Node {
     }
 
     #[inline]
+    pub(crate) fn try_leaf(&self) -> error::Result<&LeafNode> {
+        if self.is_leaf {
+            Ok(unsafe { std::mem::transmute::<_, &LeafNode>(self) })
+        } else {
+            Err(error::Error::Unwind)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_internal(&self) -> error::Result<&InternalNode> {
+        if !self.is_leaf {
+            Ok(unsafe { std::mem::transmute::<_, &InternalNode>(self) })
+        } else {
+            Err(error::Error::Unwind)
+        }
+    }
+
+    #[inline]
     pub(crate) fn downcast<'a>(&'a self) -> NodeKind<&'a LeafNode, &'a InternalNode> {
         if self.is_leaf {
             NodeKind::Leaf(unsafe { std::mem::transmute::<_, &'a LeafNode>(self) })
@@ -161,17 +184,17 @@ impl Node {
     }
 
     #[inline]
-    pub(crate) fn can_merge_with(&self, other: &Self) -> bool {
+    pub(crate) fn try_can_merge_with(&self, other: &Self) -> error::Result<bool> {
         match self.downcast() {
             NodeKind::Leaf(l) => {
                 let full_space_used = l.used_capacity_after_compaction()
-                    + other.as_leaf().used_capacity_after_compaction();
-                full_space_used < self.capacity
+                    + other.try_leaf()?.used_capacity_after_compaction();
+                Ok(full_space_used < self.capacity)
             },
             NodeKind::Internal(i) => {
                 let full_space_used = i.used_capacity_after_compaction()
-                    + other.as_internal().used_capacity_after_compaction();
-                full_space_used < self.capacity
+                    + other.try_internal()?.used_capacity_after_compaction();
+                Ok(full_space_used < self.capacity)
             }
         }
     }
@@ -416,7 +439,10 @@ impl LeafNode {
     #[inline]
     pub(crate) fn value_at_mut(&mut self, pos: usize) -> &mut [u8] {
         let slot = unsafe { self.slots().get_unchecked(pos) }; // TODO maybe check bounds?
-        self.base.sized_mut(slot.offset + slot.key_len as usize, slot.payload_len)
+        let offset = slot.offset;
+        let key_len = slot.key_len;
+        let payload_len = slot.payload_len;
+        self.base.sized_mut(offset + key_len as usize, payload_len)
     }
 
     #[inline]
@@ -580,7 +606,7 @@ impl LeafNode {
             return None;
         }
 
-        let (pos, _) = self.lower_bound(key.as_ref()).expect("under mut ref");
+        let (pos, _) = self.lower_bound(key.as_ref()).unopt();
         let curr_len = self.base.len;
         let new_slots = self.slots_with_len_mut(self.base.len + 1);
         new_slots.copy_within(pos..curr_len, pos + 1);
@@ -665,6 +691,14 @@ impl LeafNode {
         let key = key.as_ref();
         let payload = payload.as_ref();
 
+        if &key[..self.base.prefix_len] != self.base.prefix().unopt() {
+            let lower = to_u64(self.base.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0]));
+            let upper = to_u64(self.base.upper_fence().unopt().unwrap_or(&[255, 255, 255, 255, 255, 255, 255, 255]));
+            let k = to_u64(key);
+            println!("bug upper: {}, lower: {}, k: {}", upper, lower, k);
+            std::process::exit(3);
+        }
+
         let key_suffix = &key[self.base.prefix_len..];
 
         let key_len = key_suffix.len();
@@ -694,7 +728,7 @@ impl LeafNode {
     fn copy_key_value_range(&self, src_pos: usize, dst: &mut LeafNode, dst_pos: usize, amount: usize) -> error::Result<()> {
         let size_of_slot = std::mem::size_of::<Slot>();
 
-        if self.base.prefix_len == dst.base.prefix_len { // TODO shouldn't this compare the actual prefixes?
+        if self.base.prefix()? == dst.base.prefix().unopt() { // TODO shouldn't this compare the actual prefixes?
             // Fast path
             let dst_slots = LeafNode::slots_from_data_mut(&mut dst.base.data, dst.base.len + amount);
             unsafe {
@@ -721,20 +755,24 @@ impl LeafNode {
             }
         }
 
-        dst.base.len += amount;
+        dst.base.len = dst_pos + amount; // TODO before it was len += amount, check?
         assert!(dst.base.data_offset >= size_of_slot * dst.base.len);
+        // dst.check_node();
         Ok(())
     }
 
+    #[inline(never)]
     pub(crate) fn compactify(&mut self) {
+        // self.check_node();
         let space_after_compation = self.free_space_after_compaction();
         let mut tmp_node = BoxedNode::new(true, self.base.capacity);
         let tmp_leaf = tmp_node.as_leaf_mut();
-        tmp_leaf.set_fences(self.base.lower_fence().unwrap(), self.base.upper_fence().unwrap());
-        self.copy_key_value_range(0, tmp_leaf, 0, self.base.len).expect("under mut ref");
+        tmp_leaf.set_fences(self.base.lower_fence().unopt(), self.base.upper_fence().unopt());
+        self.copy_key_value_range(0, tmp_leaf, 0, self.base.len).unopt();
         // tmp_leaf.upper_edge = self.upper_edge not needed on leaf
         tmp_node.copy_to(&mut self.base);
         self.make_hint();
+        // self.check_node();
         assert!(self.free_space() == space_after_compation);
     }
 
@@ -787,7 +825,7 @@ impl LeafNode {
     }
 
     pub(crate) fn remove<K: AsRef<[u8]>>(&mut self, key: K) -> bool {
-        if let Some(pos) = self.lower_bound_exact(key.as_ref()).expect("under mut ref") {
+        if let Some(pos) = self.lower_bound_exact(key.as_ref()).unopt() {
             self.remove_slot_at(pos);
             true
         } else {
@@ -807,30 +845,50 @@ impl LeafNode {
         sorted
     }
 
+//     pub (crate) fn check_node(&mut self) {
+//         let len = self.base.len;
+//         let mut prev_key = 0;
+//         for i in 0..len {
+//             let key = to_u64(self.full_key_at(i).unopt().as_slice());
+//             let value = to_u64(self.value_at(i).unopt());
+//             if key != value {
+//                 panic!("key and value differ {} != {}", key, value);
+//             }
+//             if key != 0 && prev_key >= key {
+//                 panic!("wrong ordering prev: {}, curr: {}", prev_key, key);
+//             }
+//             prev_key = key;
+//         }
+//     }
+
     pub(crate) fn split(&mut self, right: &mut LeafNode, split_pos: usize) {
-        // assert!(self.is_sorted());
-        let split_key = self.full_key_at(split_pos).expect("under mut ref");
+        let stored_len = self.base.len;
+        // self.check_node();
+        let split_key = self.full_key_at(split_pos).unopt();
         let mut left_node = BoxedNode::new(true, self.base.capacity);
         let left = left_node.as_leaf_mut();
-        left.set_fences(self.base.lower_fence().expect("under mut ref"), Some(&split_key));
+        left.set_fences(self.base.lower_fence().unopt(), Some(&split_key));
         assert!(right.base.len == 0);
-        right.set_fences(Some(&split_key), self.base.upper_fence().expect("under mut ref"));
-        self.copy_key_value_range(0, left, 0, split_pos + 1).expect("under mut ref");
-        self.copy_key_value_range(split_pos + 1, right, 0, self.base.len - (split_pos + 1)).expect("under mut ref");
+        right.set_fences(Some(&split_key), self.base.upper_fence().unopt());
+        self.copy_key_value_range(0, left, 0, split_pos + 1).unopt();
+        self.copy_key_value_range(split_pos + 1, right, 0, self.base.len - (split_pos + 1)).unopt();
 
         left.make_hint();
         right.make_hint();
 
-        // assert!(right.is_sorted());
+        // right.check_node();
 
         left_node.copy_to(&mut self.base);
-        // assert!(self.is_sorted());
+        // self.check_node();
+        assert!(stored_len == self.base.len + right.base.len);
     }
 
     pub(crate) fn merge(&mut self, right: &mut LeafNode) -> bool {
+        // self.check_node();
+        // right.check_node();
         let mut tmp_node = BoxedNode::new(true, self.base.capacity);
         let tmp = tmp_node.as_leaf_mut();
-        tmp.set_fences(self.base.lower_fence().expect("under mut ref"), right.base.upper_fence().expect("under mut ref"));
+        tmp.set_fences(self.base.lower_fence().unopt(), right.base.upper_fence().unopt());
         let left_grow = (self.base.prefix_len - tmp.base.prefix_len) * self.base.len;
         let right_grow = (right.base.prefix_len - tmp.base.prefix_len) * right.base.len;
         let space_upper_bound = self.base.space_used + right.base.space_used + (std::mem::size_of::<Slot>() * (self.base.len + right.base.len)) + left_grow + right_grow;
@@ -839,12 +897,13 @@ impl LeafNode {
             return false;
         }
 
-        self.copy_key_value_range(0, tmp, 0, self.base.len).expect("under mut ref");
-        right.copy_key_value_range(0, tmp, self.base.len, right.base.len).expect("under mut ref");
+        self.copy_key_value_range(0, tmp, 0, self.base.len).unopt();
+        right.copy_key_value_range(0, tmp, self.base.len, right.base.len).unopt();
 
         tmp.make_hint();
         tmp_node.copy_to(&mut self.base);
 
+        // self.check_node();
         true
     }
 }
@@ -855,10 +914,10 @@ struct InnerSlot {
     offset: usize,
     key_len: u32,
     head: u32,
-    payload: Swip<HybridLatch<BufferFrame<Node>>>
+    payload: Swip<HybridLatch<BufferFrame>>
 }
 
-const EDGE_LEN: usize = std::mem::size_of::<Swip<HybridLatch<BufferFrame<Node>>>>();
+const EDGE_LEN: usize = std::mem::size_of::<Swip<HybridLatch<BufferFrame>>>();
 
 #[repr(C)]
 pub struct InternalNode {
@@ -948,7 +1007,7 @@ impl InternalNode {
     }
 
     #[inline]
-    pub(crate) fn edge_at(&self, pos: usize) -> error::Result<&Swip<HybridLatch<BufferFrame<Node>>>> {
+    pub(crate) fn edge_at(&self, pos: usize) -> error::Result<&Swip<HybridLatch<BufferFrame>>> {
         if pos == self.base.len {
             self.upper_edge()
         } else {
@@ -957,7 +1016,7 @@ impl InternalNode {
         }
     }
 
-    pub(crate) fn replace_edge_at(&mut self, pos: usize, new_edge: Swip<HybridLatch<BufferFrame<Node>>>) -> Swip<HybridLatch<BufferFrame<Node>>> {
+    pub(crate) fn replace_edge_at(&mut self, pos: usize, new_edge: Swip<HybridLatch<BufferFrame>>) -> Swip<HybridLatch<BufferFrame>> {
         if pos == self.base.len {
             panic!("use replace upper_edge instead");
         } else {
@@ -966,18 +1025,18 @@ impl InternalNode {
         }
     }
 
-    pub(crate) fn upper_edge(&self) -> error::Result<&Swip<HybridLatch<BufferFrame<Node>>>> {
+    pub(crate) fn upper_edge(&self) -> error::Result<&Swip<HybridLatch<BufferFrame>>> {
         match self.base.upper_edge.as_ref() {
             Some(edge) => Ok(edge),
             None => Err(error::Error::Unwind)
         }
     }
 
-    pub(crate) fn replace_upper_edge(&mut self, new_edge: Swip<HybridLatch<BufferFrame<Node>>>) -> Swip<HybridLatch<BufferFrame<Node>>> {
+    pub(crate) fn replace_upper_edge(&mut self, new_edge: Swip<HybridLatch<BufferFrame>>) -> Swip<HybridLatch<BufferFrame>> {
         self.base.upper_edge.replace(new_edge).expect("internal node must have upper edge")
     }
 
-    pub(crate) fn set_upper_edge(&mut self, new_edge: Swip<HybridLatch<BufferFrame<Node>>>) {
+    pub(crate) fn set_upper_edge(&mut self, new_edge: Swip<HybridLatch<BufferFrame>>) {
         let res = self.base.upper_edge.replace(new_edge);
         debug_assert!(res.is_none());
     }
@@ -1131,13 +1190,13 @@ impl InternalNode {
 
     // TODO insert_reserve_payload
 
-    pub(crate) fn insert<K: AsRef<[u8]>>(&mut self, key: K, payload: Swip<HybridLatch<BufferFrame<Node>>>) -> Option<usize> {
+    pub(crate) fn insert<K: AsRef<[u8]>>(&mut self, key: K, payload: Swip<HybridLatch<BufferFrame>>) -> Option<usize> {
         debug_assert!(self.can_insert(key.as_ref().len()));
         if !self.prepare_insert(key.as_ref().len()) {
             return None;
         }
 
-        let (pos, _) = self.lower_bound(key.as_ref()).expect("under mut ref");
+        let (pos, _) = self.lower_bound(key.as_ref()).unopt();
         let curr_len = self.base.len;
         let new_slots = self.slots_with_len_mut(self.base.len + 1);
         new_slots.copy_within(pos..curr_len, pos + 1);
@@ -1197,7 +1256,7 @@ impl InternalNode {
         self.base.prefix_len = prefix_len;
     }
 
-    fn store_key_value<K: AsRef<[u8]>>(&mut self, pos: usize, key: K, payload: Swip<HybridLatch<BufferFrame<Node>>>) {
+    fn store_key_value<K: AsRef<[u8]>>(&mut self, pos: usize, key: K, payload: Swip<HybridLatch<BufferFrame>>) {
         use std::convert::TryInto;
 
         let key = key.as_ref();
@@ -1227,7 +1286,7 @@ impl InternalNode {
     fn copy_key_value_range(&self, src_pos: usize, dst: &mut InternalNode, dst_pos: usize, amount: usize) -> error::Result<()> {
         let size_of_slot = std::mem::size_of::<InnerSlot>();
 
-        if self.base.prefix_len == dst.base.prefix_len { // TODO shouldn't this compare the actual prefixes?
+        if self.base.prefix()? == dst.base.prefix().unopt() { // TODO shouldn't this compare the actual prefixes?
             // Fast path
             let dst_slots = InternalNode::slots_from_data_mut(&mut dst.base.data, dst.base.len + amount);
             unsafe {
@@ -1250,13 +1309,14 @@ impl InternalNode {
         } else {
             for i in 0..amount {
                 let full_key = self.full_key_at(src_pos + i)?;
-                let payload = self.edge_at(src_pos + 1)?;
+                let payload = self.edge_at(src_pos + i)?;
                 dst.store_key_value(dst_pos + i, full_key, payload.clone());
             }
         }
 
-        dst.base.len += amount;
+        dst.base.len = dst_pos + amount;
         assert!(dst.base.data_offset >= size_of_slot * dst.base.len);
+        // dst.check_node();
         Ok(())
     }
 
@@ -1265,7 +1325,7 @@ impl InternalNode {
         let mut tmp_node = BoxedNode::new(false, self.base.capacity);
         let tmp_internal = tmp_node.as_internal_mut();
         tmp_internal.set_fences(self.base.lower_fence().unwrap(), self.base.upper_fence().unwrap());
-        self.copy_key_value_range(0, tmp_internal, 0, self.base.len).expect("under mut ref");
+        self.copy_key_value_range(0, tmp_internal, 0, self.base.len).unopt();
         tmp_internal.base.upper_edge = self.base.upper_edge;
         tmp_node.copy_to(&mut self.base);
         self.make_hint();
@@ -1315,7 +1375,7 @@ impl InternalNode {
     }
 
     pub(crate) fn remove<K: AsRef<[u8]>>(&mut self, key: K) -> bool {
-        if let Some(pos) = self.lower_bound_exact(key.as_ref()).expect("under mut ref") {
+        if let Some(pos) = self.lower_bound_exact(key.as_ref()).unopt() {
             self.remove_slot_at(pos);
             true
         } else {
@@ -1327,7 +1387,7 @@ impl InternalNode {
         self.remove_slot_at(pos)
     }
 
-    pub(crate) fn remove_edge_at(&mut self, pos: usize) -> Swip<HybridLatch<BufferFrame<Node>>> {
+    pub(crate) fn remove_edge_at(&mut self, pos: usize) -> Swip<HybridLatch<BufferFrame>> {
         let slot = unsafe { self.slots_mut().get_unchecked_mut(pos) }; // TODO maybe check bounds?
         let payload = slot.payload.clone();
         drop(slot);
@@ -1335,32 +1395,47 @@ impl InternalNode {
         payload
     }
 
+//     pub (crate) fn check_node(&mut self) {
+//         let len = self.base.len;
+//         let mut prev_key = 0;
+//         for i in 0..len {
+//             let key = to_u64(self.full_key_at(i).unopt().as_slice());
+//             if prev_key >= key {
+//                 panic!("wrong ordering");
+//             }
+//             prev_key = key;
+//         }
+//     }
+
     pub(crate) fn split(&mut self, right: &mut InternalNode, split_pos: usize) {
-        let split_key = self.full_key_at(split_pos).expect("under mut ref");
+        // self.check_node();
+        let split_key = self.full_key_at(split_pos).unopt();
         let mut left_node = BoxedNode::new(false, self.base.capacity);
         let left = left_node.as_internal_mut();
-        left.set_fences(self.base.lower_fence().expect("under mut ref"), Some(&split_key));
+        left.set_fences(self.base.lower_fence().unopt(), Some(&split_key));
         assert!(right.base.len == 0);
-        right.set_fences(Some(&split_key), self.base.upper_fence().expect("under mut ref"));
+        right.set_fences(Some(&split_key), self.base.upper_fence().unopt());
 
-        self.copy_key_value_range(0, left, 0, split_pos).expect("under mut ref");
-        self.copy_key_value_range(split_pos + 1, right, 0, self.base.len - (split_pos - 1)).expect("under mut ref");
-        left.base.upper_edge = Some(self.edge_at(split_pos).expect("under mut ref").clone());
+        self.copy_key_value_range(0, left, 0, split_pos).unopt();
+        self.copy_key_value_range(split_pos + 1, right, 0, self.base.len - (split_pos + 1)).unopt();
+        left.base.upper_edge = Some(self.edge_at(split_pos).unopt().clone());
         right.base.upper_edge = self.base.upper_edge.clone();
 
         left.make_hint();
         right.make_hint();
 
         left_node.copy_to(&mut self.base);
+        // self.check_node();
     }
 
     pub(crate) fn merge(&mut self, right: &mut InternalNode) -> bool {
+        // self.check_node();
         let mut tmp_node = BoxedNode::new(false, self.base.capacity);
         let tmp = tmp_node.as_internal_mut();
-        tmp.set_fences(self.base.lower_fence().expect("under mut ref"), right.base.upper_fence().expect("under mut ref"));
+        tmp.set_fences(self.base.lower_fence().unopt(), right.base.upper_fence().unopt());
         let left_grow = (self.base.prefix_len - tmp.base.prefix_len) * self.base.len;
         let right_grow = (right.base.prefix_len - tmp.base.prefix_len) * right.base.len;
-        let extra_key = right.base.lower_fence().expect("under mut ref").expect("lower fence must exist");
+        let extra_key = right.base.lower_fence().unopt().expect("lower fence must exist");
         let space_upper_bound = self.base.space_used
             + right.base.space_used
             + (std::mem::size_of::<Slot>() * (self.base.len + right.base.len))
@@ -1373,19 +1448,20 @@ impl InternalNode {
         }
 
         // Copy left contents
-        self.copy_key_value_range(0, tmp, 0, self.base.len).expect("under mut ref");
+        self.copy_key_value_range(0, tmp, 0, self.base.len).unopt();
 
         // Extra key insertion
         tmp.store_key_value(self.base.len, extra_key, self.base.upper_edge.clone().expect("left must have upper edge"));
         tmp.base.len += 1;
 
         // Copy right contents
-        right.copy_key_value_range(0, tmp, self.base.len, right.base.len).expect("under mut ref");
+        right.copy_key_value_range(0, tmp, tmp.base.len, right.base.len).unopt();
         tmp.base.upper_edge = right.base.upper_edge.clone();
 
         tmp.make_hint();
         tmp_node.copy_to(&mut self.base);
 
+        // self.check_node();
         true
     }
 }

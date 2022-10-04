@@ -14,6 +14,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub trait NonOptimisticExt<T> {
+    fn unopt(self) -> T;
+}
+
+impl<T> NonOptimisticExt<T> for Result<T> {
+    fn unopt(self) -> T {
+        self.expect("non optimistic")
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum BufMgrError {
     /// Requested size class is not a valid size class
