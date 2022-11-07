@@ -28,7 +28,7 @@ smallvec = { version = "1.6", features = ["const_generics"]}
 
 nix = "0.23"
 crossbeam-queue = "0.3"
-scc = "0.5.7"
+scc = "0.11.2"
 once_cell = "1.8"
 indexmap = "1.7"
 io-uring = "0.5.2"
