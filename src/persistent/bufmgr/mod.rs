@@ -86,7 +86,10 @@ impl BufferFrame {
         self.pid = Pid::new_invalid(old_pid.size_class());
         // self.dirty = false; // TODO check
         // TODO clear page?
-        self.page_bytes_mut().fill(0);
+        #[cfg(debug_assertions)]
+        {
+            self.page_bytes_mut().fill(0);
+        }
         // unsafe { std::slice::from_raw_parts_mut(self.page as *mut _ as *mut u8, size) }.fill(0);
     }
 
@@ -194,9 +197,9 @@ impl SizeClass {
                 break bf;
             }
 
-            if tries > 10 { // TODO tune this value
+            if true || tries > 10 { // TODO tune this value // FIXME disabled
                 // dbg_global_report!();
-                println!("ALLOCATE");
+                // println!("ALLOCATE");
                 // dbg_local_report!();
                 // panic!("test");
                 return Err(BufMgrError::OutOfFrames(self.class))
@@ -305,7 +308,7 @@ impl IoSlot {
                         break bf;
                     }
 
-                    if tries > 100 { // TODO tune this value
+                    if true || tries > 100 { // TODO tune this value // FIXME disabled
                         tp!("TRANSITION");
                         return Err(BufMgrError::OutOfFrames(self.pid.size_class().into()));
                     }
