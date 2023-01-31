@@ -943,27 +943,27 @@ impl PersistentBPlusTree {
 
                 assert!(target_guard.latch() as *const _ == needle.latch() as *const _);
 
+                let mut parent_guard_x = parent_guard.to_exclusive_bf()?;
+                let mut target_guard_x = target_guard.to_exclusive_bf()?;
+
                 // let split_pos = target_guard.len() / 2; // TODO choose a better split position if bulk loading
-                let split_strategy = match target_guard.downcast() {
+                let split_strategy = match target_guard_x.downcast() {
                     NodeKind::Leaf(leaf) => {
                         leaf.split_heuristic(entry_hint)?
                     },
                     NodeKind::Internal(internal) => {
-                        let split_pos = target_guard.len() / 2;
+                        let split_pos = target_guard_x.len() / 2;
                         let split_key = internal.full_key_at(split_pos)?;
                         SplitStrategy::SplitAt { key: split_key, split_pos, new_left_size: None, right_size: 1 }
                     }
                 };
 
                 let space_needed = match &split_strategy {
-                    SplitStrategy::SplitAt { key, .. } => parent_guard.try_internal()?.space_needed(split_strategy.split_key().len()),
+                    SplitStrategy::SplitAt { key, .. } => parent_guard_x.try_internal()?.space_needed(split_strategy.split_key().len()),
                     SplitStrategy::Grow { .. } => 0
                 };
 
-                if parent_guard.try_internal()?.has_enough_space_for(space_needed) {
-                    let mut parent_guard_x = parent_guard.to_exclusive_bf()?;
-                    let mut target_guard_x = target_guard.to_exclusive_bf()?;
-
+                if parent_guard_x.try_internal()?.has_enough_space_for(space_needed) {
                     match target_guard_x.downcast_mut() {
                         NodeKind::Internal(left_internal) => {
                             if left_internal.base.len() <= 2 {
@@ -1094,7 +1094,9 @@ impl PersistentBPlusTree {
                         }
                     }
                 } else {
-                    parent_guard.recheck()?;
+                    // parent_guard.recheck()?;
+                    let parent_guard = parent_guard_x.unlock();
+                    target_guard_x.unlock();
                     self.try_split(&parent_guard, None)?;
                 }
             }
