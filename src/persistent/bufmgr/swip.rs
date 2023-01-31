@@ -1,5 +1,5 @@
 use std::fmt;
-use bplustree::error;
+use crate::error;
 
 const COOL_BIT: u64 =        0b0000000000000000000000000000000000000000000000000000000000000010;
 const UNSWIZZLED_BIT: u64 =  0b0000000000000000000000000000000000000000000000000000000000000001;
@@ -151,6 +151,11 @@ impl<T: 'static> Swip<T> {
     #[inline]
     pub fn as_raw(&self) -> u64 {
         unsafe { self.raw }
+    }
+
+    #[inline]
+    pub fn as_hot_ptr(&self) -> u64 {
+        unsafe { self.raw & HOT_MASK }
     }
 
     #[inline]

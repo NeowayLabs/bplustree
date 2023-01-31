@@ -20,7 +20,8 @@ pub trait NonOptimisticExt<T> {
 
 impl<T> NonOptimisticExt<T> for Result<T> {
     fn unopt(self) -> T {
-        self.expect("non optimistic")
+        debug_assert!(self.is_ok());
+        unsafe { self.unwrap_unchecked() }
     }
 }
 

@@ -1,13 +1,46 @@
 #[cfg(test)]
 mod benchmark {
-    use crate::tree::PersistentBPlusTree;
-    use crate::ensure_global_bufmgr;
+    use crate::persistent::debug::print_dbg_reports;
+    use crate::persistent::tree::PersistentBPlusTree;
+    use crate::persistent::ensure_global_bufmgr;
     use serial_test::serial;
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
+
+    const TIMING: bool = true;
+
+    macro_rules! start {
+        ($val:ident) => {
+            let $val = if TIMING {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+        };
+    }
+
+    macro_rules! end {
+        ($val:ident) => {
+            if TIMING {
+                let $val = $val.as_ref().unwrap();
+                dbg!($val.elapsed());
+            }
+        };
+        ($val:ident, $ex:expr) => {
+            if TIMING {
+                let $val = $val.as_ref().unwrap();
+                dbg!($val.elapsed(), $ex);
+            }
+        };
+    }
+
+    #[inline(never)]
+    fn blah() {
+        println!("here");
+    }
 
     #[test]
     #[serial]
@@ -16,14 +49,17 @@ mod benchmark {
         use rand::distributions::WeightedIndex;
         use rand::seq::SliceRandom;
 
-        ensure_global_bufmgr("/tmp/state.db", 50 * 1024 * 1024).unwrap();
+        ensure_global_bufmgr("/dev/shm/state.db", 1024 * 1024 * 1024).unwrap();
 
         let empty = false;
-        let n_ops = 7000000 * 1;
-        let n_threads = 7;
+        let n_ops = 1000000 * 15;
+        let n_threads = 15;
         let ops_per_thread = n_ops / n_threads;
+        // ops: [insert, remove, lookup, scan, full_scan]
+        // let weights = [0.0, 0.0, 100.0, 0.0, 0.00];
         let weights = [20.0, 20.0, 55.0, 5.0, 0.00];
         // let weights = [00.0, 100.0, 0.0, 0.0, 0.00];
+        // let weights = [50.0, 50.0,  0.0, 0.0, 0.00];
 
         println!("{}", ops_per_thread);
 
@@ -38,11 +74,19 @@ mod benchmark {
             data.shuffle(&mut rng);
 
             println!("Started insertion");
+            start!(t_insert);
             for i in 0..ops_per_thread {
                 let mut iter = treeindex.raw_iter_mut();
-                iter.insert(data[i].to_be_bytes(), data[i].to_be_bytes());
+                if i % 1000 == 0 {
+                    iter.insert(data[i].to_be_bytes(), b"0".repeat(128 * 1024));
+                } else {
+                    iter.insert(data[i].to_be_bytes(), data[i].to_be_bytes());
+                }
             }
+            end!(t_insert);
         }
+
+        println!("Insertion done");
 
         let mut handles = vec![];
         for _ in 0..n_threads {
@@ -71,7 +115,9 @@ mod benchmark {
                             n_operations += 1;
                         }
                         2 => {
+                            // start!(t_lookup);
                             let _ = treeindex.lookup(&data[i].to_be_bytes(), |_| ());
+                            // end!(t_lookup);
                             n_operations += 1;
                         }
                         3 => {
@@ -115,6 +161,8 @@ mod benchmark {
             handle.join().unwrap();
         }
 
+        let ops = total_num_operations.load(Relaxed);
         println!("{:?} {}", end_time.saturating_duration_since(start_time), total_num_operations.load(Relaxed));
+        print_dbg_reports(ops);
     }
 }

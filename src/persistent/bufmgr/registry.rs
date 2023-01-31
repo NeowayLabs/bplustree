@@ -1,16 +1,23 @@
-use std::sync::{
+use std::{sync::{
     Arc,
     atomic::{
         AtomicU64,
         Ordering
     }
-};
-use super::{BufferFrame, OptSwipGuard, Swip};
-use bplustree::{error, latch::{HybridLatch, OptimisticGuard, HybridGuard}};
+}, fmt::Debug};
+
+use super::{BufferFrame, OptSwipGuard, Swip, swip::Pid};
+use crate::{error, latch::{HybridLatch, OptimisticGuard, HybridGuard}};
 
 pub(crate) enum ParentResult {
     Root,
     Parent(OptSwipGuard<'static>)
+}
+
+#[derive(Debug)]
+pub(crate) struct FrameDebugInfo {
+    pid: Pid,
+    value_info: Box<dyn Debug + Send>
 }
 
 pub(crate) trait ManagedDataStructure {
@@ -20,6 +27,9 @@ pub(crate) trait ManagedDataStructure {
     fn find_parent(&self, needle: &impl HybridGuard<Self::PageValue, BufferFrame>) -> error::Result<ParentResult>;
     fn iterate_children_swips<'a>(&self, needle: &Self::PageValue, f: Box<dyn FnMut(&Swip<HybridLatch<BufferFrame>>) -> error::Result<bool> + 'a>) -> error::Result<()>;
     fn inspect(&self, tag: &str, value: &Self::PageValue) {}
+    fn debug_info(&self, value: &Self::PageValue) -> Box<dyn Debug + Send> {
+        Box::new(())
+    }
 }
 
 pub(crate) trait ErasedDataStructure {
@@ -27,6 +37,7 @@ pub(crate) trait ErasedDataStructure {
     fn iterate_children_swips<'a>(&self, needle: &BufferFrame, f: Box<dyn FnMut(&Swip<HybridLatch<BufferFrame>>) -> error::Result<bool> + 'a>) -> error::Result<()>;
     // fn scan_children_swips<A>(&self, needle: &OptimisticGuard<'static, BufferFrame>, acc: A, f: Box<dyn Fn(&Swip<HybridLatch<BufferFrame>>) -> error::Result<bool>>) -> error::Result<()>;
     fn inspect(&self, tag: &str, needle: &BufferFrame);
+    fn debug_info(&self, frame: &BufferFrame) -> FrameDebugInfo;
 }
 
 impl <T, U: ManagedDataStructure<PageValue = T>> ErasedDataStructure for U {
@@ -42,6 +53,9 @@ impl <T, U: ManagedDataStructure<PageValue = T>> ErasedDataStructure for U {
     }
     fn inspect(&self, tag: &str, frame: &BufferFrame) {
         self.inspect(tag, U::bf_to_page_value(frame));
+    }
+    fn debug_info(&self, frame: &BufferFrame) -> FrameDebugInfo {
+        FrameDebugInfo { pid: frame.pid, value_info: self.debug_info(U::bf_to_page_value(frame)) }
     }
 //     fn find_parent(&self) {
 //         self.find_parent(self.get_page_value())

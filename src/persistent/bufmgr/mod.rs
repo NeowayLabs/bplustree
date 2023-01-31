@@ -4,13 +4,14 @@ use nix::sys::mman::{
     MmapAdvise
 };
 
-use crossbeam_queue::ArrayQueue;
+use crossbeam_queue::{ArrayQueue, SegQueue};
 
 use parking_lot::Mutex;
 
-use bplustree::latch::{HybridLatch, OptimisticGuard, SharedGuard, ExclusiveGuard};
+use crate::{dbg_global_report, dbg_local_report};
+use crate::latch::{HybridLatch, OptimisticGuard, SharedGuard, ExclusiveGuard, HybridGuard};
 
-use bplustree::error::{self, BufMgrError};
+use crate::error::{self, BufMgrError};
 
 use std::fmt;
 use std::sync::{
@@ -23,13 +24,26 @@ pub mod swip;
 
 pub mod registry;
 
-// pub mod write_buffer;
+pub mod latch_ext;
 
-// use write_buffer::WriteBuffer;
+pub mod write_buffer;
+
+use write_buffer::WriteBuffer;
 
 use swip::{Pid, Swip, RefOrPid};
 
 use registry::{DataStructureId, Registry, ParentResult};
+
+use crate::persistent::bufmgr::write_buffer::LatchOrGuard;
+
+macro_rules! tp {
+    ($x:expr) => {
+        // println!("[{:?}] {}", std::thread::current().id(), format!($x));
+    };
+    ($x:expr, $($y:expr),+) => {
+        // println!("[{:?}] {}", std::thread::current().id(), format!($x, $($y),+));
+    };
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -46,7 +60,8 @@ pub enum BfState {
     Free,
     Hot,
     Cool,
-    Loaded
+    Loaded,
+    Reclaim
 }
 
 #[derive(Debug)]
@@ -54,20 +69,35 @@ pub enum BfState {
 pub struct BufferFrame {
     pub state: BfState,
     pub pid: Pid,
+    pub last_written_gsn: u64,
+    pub writting: bool,
     // padding: [u8; 512 - (std::mem::size_of::<HybridLatch<()>>() + (std::mem::size_of::<u64>() * 2))], // Alignment hack, very dependent on BufferFrame fields
     pub(crate) page: &'static mut Page
 }
 
 impl BufferFrame {
     fn reset(&mut self) {
+        assert!(!self.writting);
         let old_pid = self.pid;
         let size = 2usize.pow(old_pid.size_class() as u32);
-        // self.last_written_gsn = 0;
+        self.last_written_gsn = 0;
+        self.writting = false;
         self.state = BfState::Free;
         self.pid = Pid::new_invalid(old_pid.size_class());
+        // self.dirty = false; // TODO check
         // TODO clear page?
+        self.page_bytes_mut().fill(0);
         // unsafe { std::slice::from_raw_parts_mut(self.page as *mut _ as *mut u8, size) }.fill(0);
     }
+
+    fn is_dirty(&self) -> bool {
+        // self.dirty
+        self.page.gsn > self.last_written_gsn
+    }
+
+//      fn set_dirty(&mut self, dirty: bool) {
+//          self.dirty = dirty
+//      }
 
     fn page_bytes(&self) -> &[u8] {
         let size = 2usize.pow(self.pid.size_class() as u32);
@@ -122,20 +152,26 @@ unsafe impl Send for BufferFrame {}
 //     fn swip_mut(&mut self, tag: Self::SwipTag) -> Option<&mut Swip<HybridLatch<BufferFrame<Self>>>> where Self: Sized;
 // }
 
+
+// TODO Limit pool size across size classes
 #[derive(Debug)]
 pub struct SizeClass {
     class: usize,
     offset: Arc<AtomicUsize>,
     frames: Vec<HybridLatch<BufferFrame>>,
     free_frames: ArrayQueue<&'static HybridLatch<BufferFrame>>,
-    free_pids: ArrayQueue<Pid>,
+    free_pids: SegQueue<Pid>,
     cool_frames: ArrayQueue<&'static HybridLatch<BufferFrame>>,
-    write_buffer_count: AtomicUsize
+    // write_buffer_count: AtomicUsize
 }
 
 impl SizeClass {
     pub fn class_size(&self) -> usize {
         2usize.pow(self.class as u32)
+    }
+
+    pub fn contains_frame(&self, frame: &HybridLatch<BufferFrame>) -> bool {
+        self.frames.iter().find(|&f| f as *const _ == frame as *const _).is_some()
     }
 
     pub fn next_pid(&self) -> Pid {
@@ -148,9 +184,7 @@ impl SizeClass {
     }
 
     pub fn free_page(&self, pid: Pid) {
-        if let Err(e) = self.free_pids.push(pid) {
-            unreachable!("should have space");
-        }
+        self.free_pids.push(pid);
     }
 
     pub fn allocate_page(&'static self, dtid: DataStructureId) -> Result<ExclusiveGuard<'static, BufferFrame>, BufMgrError> {
@@ -161,7 +195,10 @@ impl SizeClass {
             }
 
             if tries > 10 { // TODO tune this value
-                // println!("ALLOCATE");
+                // dbg_global_report!();
+                println!("ALLOCATE");
+                // dbg_local_report!();
+                // panic!("test");
                 return Err(BufMgrError::OutOfFrames(self.class))
             }
 
@@ -175,9 +212,10 @@ impl SizeClass {
         assert!(bf.state == BfState::Free);
         bf.pid = free_pid;
         bf.state = BfState::Hot;
-        // bf.last_written_gsn = 0;
+        // bf.dirty = false;
+        bf.last_written_gsn = 0;
         bf.page.size_class = self.class as u64;
-        bf.page.gsn = 0;
+        bf.page.gsn = 1; // Starting page gsn as 1 to ensure it will be written at least once
         bf.page.dtid = dtid;
 
         // if free_pid.page_id() > pool_size { println!("going larger than memory") }
@@ -187,12 +225,20 @@ impl SizeClass {
 
     pub fn reclaim_page(&self, mut frame: ExclusiveGuard<'static, BufferFrame>) {
         assert_eq!(frame.page.size_class, self.class as u64);
-        self.free_page(frame.pid);
-        frame.reset();
-        // should we unlock after the push?
-        let unlocked = frame.unlock();
-        if let Err(e) = self.free_frames.push(unlocked.latch()) {
-            unreachable!("should have space");
+
+        if frame.writting {
+            frame.state = BfState::Reclaim;
+            let _ = frame.unlock();
+            // frame will be pushed into free_frames after writting is complete
+        } else {
+            self.free_page(frame.pid);
+            
+            frame.reset();
+            // should we unlock after the push?
+            let unlocked = frame.unlock();
+            if let Err(e) = self.free_frames.push(unlocked.latch()) {
+                unreachable!("should have space");
+            }
         }
     }
 
@@ -251,7 +297,7 @@ impl IoSlot {
         use IoCommand::*;
 
         match (&self.state, command)  {
-            (Evicted, Load) => {
+            (Evicted | Aborted, Load) => {
                 let size_class = self.bufmgr.size_class(self.pid.size_class());
                 let mut tries = 0;
                 let free_bf = loop {
@@ -260,6 +306,7 @@ impl IoSlot {
                     }
 
                     if tries > 100 { // TODO tune this value
+                        tp!("TRANSITION");
                         return Err(BufMgrError::OutOfFrames(self.pid.size_class().into()));
                     }
 
@@ -270,9 +317,10 @@ impl IoSlot {
 
                 assert!(frame.state == BfState::Free);
 
-                self.bufmgr.read_page_sync(self.pid, frame.page)?;
-                // frame.last_written_gsn = frame.page.gsn;
+                self.bufmgr.read_page_sync(self.pid, frame.page).map_err(|e| { println!("failed to read: {}", e); e })?;
+                frame.last_written_gsn = frame.page.gsn;
                 frame.state = BfState::Loaded;
+                assert!(!frame.writting);
                 frame.pid = self.pid;
 
                 self.state = Loaded(free_bf);
@@ -283,11 +331,16 @@ impl IoSlot {
                 assert!(!swip_x_guard.is_ref());
                 if let RefOrPid::Pid(p) = swip_x_guard.downcast() {
                     assert_eq!(self.pid, p);
+                    assert_eq!(self.pid, frame.pid);
                 } else {
                     panic!("not pid");
                 }
                 swip_x_guard.to_ref(loaded_frame);
                 frame.state = BfState::Hot; // VERIFY: set to hot after swizzled in?
+
+                crate::dbg_swizzle_in!(self.bufmgr, swip_x_guard, &frame);
+//                  let dt = self.bufmgr.registry().get(frame.page.dtid).unwrap();
+//                  println!("{:?}, {:?}", dt.debug_info(swip_x_guard.as_unmapped()), dt.debug_info(&frame));
 
                 let outcome = IoOutcome::SwipAndFrame(swip_x_guard, loaded_frame);
                 self.state = Swizzled(loaded_frame);
@@ -384,6 +437,8 @@ impl BufferManager {
                         let latched_frame = HybridLatch::new(BufferFrame {
                             state: BfState::Free,
                             pid: Pid::default(),
+                            last_written_gsn: 0,
+                            writting: false,
                             page: page_ref
                         });
 
@@ -394,9 +449,9 @@ impl BufferManager {
                         class,
                         offset: Arc::clone(&offset),
                         free_frames: ArrayQueue::new(frames.len()),
-                        free_pids: ArrayQueue::new(frames.len()),
+                        free_pids: SegQueue::new(),
                         cool_frames: ArrayQueue::new(frames.len()),
-                        write_buffer_count: AtomicUsize::new(0),
+                        // write_buffer_count: AtomicUsize::new(0),
                         frames
                     });
                 }
@@ -441,9 +496,11 @@ impl BufferManager {
         let size = size_class.class_size();
         let offset = pid.page_id();
         let mut slice = unsafe { std::slice::from_raw_parts_mut(page as *mut _ as *mut u8, size) };
-        // println!("pid: {:?}, slice_len: {}, offset: {}", pid, slice.len(), offset);
         let n = pread(self.fd.as_raw_fd(), &mut slice, offset as i64).map_err(|e| BufMgrError::Io(e))?;
-        assert!(n == size);
+        if n != size {
+            println!("BUG pid: {:?}, slice_len: {}, offset: {}, n: {}", pid, slice.len(), offset, n);
+        }
+        assert_eq!(n, size);
         Ok(())
     }
 
@@ -469,6 +526,11 @@ impl BufferManager {
     {
         let size_class = size_class.try_into().expect("failed to convert size class");
         &self.classes[size_class as usize - BASE_SIZE_CLASS]
+    }
+
+    pub(crate) fn capacity_for<T>(size: usize) -> usize {
+        let overhead = std::mem::size_of::<Page>() + std::mem::size_of::<T>();
+        2usize.pow(BASE_SIZE_CLASS as u32).max((size + overhead).next_power_of_two())
     }
 
     // TODO use actual node capacity
@@ -511,7 +573,8 @@ impl BufferManager {
     #[inline]
     pub fn resolve_swip_fast(
         &'static self,
-        swip_guard: OptSwipGuard<'static>
+        swip_guard: OptSwipGuard<'static>,
+        spin: bool,
     ) -> error::Result<(
         OptSwipGuard<'static>,
         &'static HybridLatch<BufferFrame>
@@ -522,14 +585,15 @@ impl BufferManager {
                 Ok((swip_guard, r))
             },
             RefOrPid::Cool(_) | RefOrPid::Pid(_) => {
-                self.resolve_swip(swip_guard)
+                self.resolve_swip(swip_guard, spin)
             }
         }
     }
 
     pub fn resolve_swip(
         &'static self,
-        mut swip_guard: OptSwipGuard<'static>
+        mut swip_guard: OptSwipGuard<'static>,
+        spin: bool,
     ) -> error::Result<(
         OptSwipGuard<'static>,
         &'static HybridLatch<BufferFrame>
@@ -541,9 +605,14 @@ impl BufferManager {
             },
             RefOrPid::Cool(r) => {
                 swip_guard.recheck()?;
-                let frame_guard = r.optimistic_or_spin();
+                let frame_guard = if spin {
+                    r.optimistic_or_spin()
+                } else {
+                    r.optimistic_or_unwind()?
+                };
                 let mut swip_x_guard = swip_guard.to_exclusive()?;
                 let mut frame_x_guard = frame_guard.to_exclusive()?;
+                assert_eq!(BfState::Cool, frame_x_guard.state);
                 frame_x_guard.state = BfState::Hot;
                 swip_x_guard.to_ref(r);
 
@@ -558,7 +627,7 @@ impl BufferManager {
 
                 return self.with_slot_or_create(pid, IoSlot::new_evicted(self, pid), |slot_guard, returned| {
                     match &slot_guard.state {
-                        IoState::Evicted => {
+                        IoState::Evicted | IoState::Aborted => {
                             if let Err(err @ error::Error::Unwind) = swip_guard.recheck() {
                                 slot_guard.state = IoState::Aborted;
                                 return (true, Err(err));
@@ -606,9 +675,10 @@ impl BufferManager {
                         IoState::Swizzled(swizzled_frame) => {
                             return (true, Err(error::Error::Unwind));
                         }
-                        IoState::Aborted  => {
-                            return (true, Err(error::Error::Unwind));
-                        }
+//                          IoState::Aborted  => {
+//                              tp!("aborted");
+//                              return (true, Err(error::Error::Unwind));
+//                          }
                     }
                 });
             }
@@ -619,18 +689,18 @@ impl BufferManager {
         where
             F: FnOnce(&mut IoSlot, Option<IoSlot>) -> (bool, R)
     {
-        let mut slot = Arc::new(Mutex::new(create_slot));
-        let mut unmoved_slot = Arc::clone(&slot);
+        let mut slot = Arc::new(Mutex::new(create_slot)); // c: 1, e: 1
+        let mut unmoved_slot = Arc::clone(&slot); // c: 2, e: 2
         let mut create_guard = unmoved_slot.lock();
         let mut existed = false;
         let mut returned = None;
 
         let mut map = self.io_map.lock();
         if let Some(slot_ref) = map.get(&pid) {
-            slot = Arc::clone(slot_ref);
+            slot = Arc::clone(slot_ref); // e: 2
             existed = true;
         } else {
-            assert!(map.insert(pid, Arc::clone(&slot)).is_none());
+            assert!(map.insert(pid, Arc::clone(&slot)).is_none()); // c: 3
         }
         drop(map);
         let mut guard = if existed {
@@ -644,13 +714,21 @@ impl BufferManager {
         let (cleanup, result) = f(&mut guard, returned);
 
         if cleanup {
-            if Arc::strong_count(&slot) <= 2 {
+            let n_guards = if existed { 2 } else { 3 };
+            tp!("should remove pid {:?}, {}", pid, Arc::strong_count(&slot));
+            if Arc::strong_count(&slot) <= n_guards {
                 // Try to remove
+                tp!("trying to remove pid {:?}, {}", pid, Arc::strong_count(&slot));
                 let mut map = self.io_map.lock();
                 let slot_ref = map.get(&guard.pid).expect("must exist");
-                if Arc::strong_count(slot_ref) <= 2 {
+                if Arc::strong_count(slot_ref) <= n_guards {
+                    tp!("removeing pid {:?}, {}", pid, Arc::strong_count(&slot));
                     map.remove(&guard.pid);
+                } else {
+                    tp!("failed removing pid {:?}, {}", pid, Arc::strong_count(&slot));
                 }
+            } else {
+                tp!("out failed removing pid {:?}, {}", pid, Arc::strong_count(&slot));
             }
         }
 
@@ -742,13 +820,29 @@ impl BufferManager {
     pub fn page_provider(&'static self) {
         // WriteBuffer::new(10000);
         use rand::Rng;
+
+        let mut map: HashMap<_, _> = self.classes.iter()
+            .map(|sc| {
+                let n_slots = ((4 * 1024 * 1024) as f64 / sc.class_size() as f64).max(2.0) as usize;
+                (sc.class, WriteBuffer::new(&self.fd, n_slots, sc.class_size()))
+            })
+            .collect();
+
         while self.running.load(Ordering::Acquire) {
             // break; // FIXME remove this to run this code
             for size_class in self.classes.iter() {
+                if size_class.frames.len() == 0 {
+                    continue;
+                }
+
                 let free_lower_bound = (size_class.frames.len() as f64  * 0.10).ceil() as usize;
                 let needs_eviction = || size_class.free_frames.len() < free_lower_bound /* && rand::thread_rng().gen_range(0..100) < 50 */;
                 let cool_lower_bound = (size_class.frames.len() as f64 * 0.20).ceil() as usize;
                 let needs_cooling = || size_class.free_frames.len() + size_class.cool_frames.len() < cool_lower_bound;
+
+                if !needs_cooling() && !needs_eviction() {
+                    continue;
+                }
 
                 let mut frame = size_class.random_frame();
 
@@ -761,10 +855,15 @@ impl BufferManager {
                 loop {
                     let mut try_cool = || {
                         while needs_cooling() && cooling_attempts < 10 { // TODO tune
+                            tp!("Trying to cool {}", cooling_attempts);
                             let mut guard = frame.optimistic_or_unwind()?;
-                            let valid_candidate = guard.state == BfState::Hot && !frame.is_exclusively_latched();
+                            let valid_candidate = guard.state == BfState::Hot
+                                && !guard.writting
+                                && !frame.is_exclusively_latched()
+                                && guard.page.size_class == size_class.class as u64;
 
                             if !valid_candidate {
+                                tp!("not valid hot: {} ({:?}), writting: {}, latched: {}, bad size class: {}", guard.state == BfState::Hot, guard.state, guard.writting, frame.is_exclusively_latched(), guard.page.size_class != size_class.class as u64);
                                 frame = size_class.random_frame();
                                 cooling_attempts += 1;
                                 continue;
@@ -788,10 +887,15 @@ impl BufferManager {
                                     },
                                     RefOrPid::Ref(r) => {
                                         all_evicted = false;
-                                        frame = r;
-                                        guard.recheck()?;
-                                        picked_child = true;
-                                        Ok(false)
+                                        if size_class.contains_frame(r) {
+                                            frame = r;
+                                            guard.recheck()?;
+                                            picked_child = true;
+                                            Ok(false)
+                                        } else {
+                                            guard.recheck()?;
+                                            Ok(true)
+                                        }
                                     }
                                 }
                             }))?;
@@ -832,7 +936,7 @@ impl BufferManager {
                                     // TODO maybe drop guards before push?
                                     size_class.cool_frames.push(frame_x_guard.latch()).expect("has space");
 
-                                    // println!("COOL");
+                                    tp!("COOL");
                                 }
                             }
                         }
@@ -854,6 +958,7 @@ impl BufferManager {
                 let evict_frame = |guard: OptimisticGuard<'static, BufferFrame>| {
                     let dtid = guard.page.dtid;
                     guard.recheck()?;
+                    tp!("surv recheck {}", guard.latch().version());
 
                     let (result, guard) = self.registry().get(dtid).expect("exists").find_parent(guard)?;
                     match result {
@@ -861,12 +966,17 @@ impl BufferManager {
                             unreachable!("cannot evict root");
                         }
                         ParentResult::Parent(swip_guard) => {
+                            tp!("surv find {}", guard.latch().version());
                             let mut swip_x_guard = swip_guard.to_exclusive()?;
+                            tp!("surv parent lock {}", guard.latch().version());
                             let mut frame_x_guard = guard.to_exclusive()?;
+                            // println!("surv frame lock");
 
                             // No need to erase from cooling, already poped
 
                             assert!(frame_x_guard.state == BfState::Cool);
+                            crate::dbg_evict_out!(self, swip_x_guard, &frame_x_guard);
+
                             swip_x_guard.to_pid(frame_x_guard.pid);
 
                             frame_x_guard.reset();
@@ -875,11 +985,15 @@ impl BufferManager {
                             if let Err(e) = size_class.free_frames.push(unlocked.latch()) {
                                 unreachable!("should have space");
                             }
+
+                            tp!("EVICTED ########################");
                         }
                     }
 
                     error::Result::Ok(())
                 };
+
+                let buffer = map.get_mut(&size_class.class).expect("initialized");
 
                 if needs_eviction() {
                     let n_pages_to_evict = free_lower_bound - size_class.free_frames.len();
@@ -888,190 +1002,130 @@ impl BufferManager {
                         let mut n_pages_left_to_evict = n_pages_to_evict;
 
                         while n_pages_left_to_evict > 0 {
+                            tp!("count = {} => {}", size_class.cool_frames.len(), n_pages_left_to_evict);
                             let cool_frame = match size_class.cool_frames.pop() {
                                 Some(f) => f,
                                 None => break
                             };
 
                             let mut try_flush = || {
-                                let mut guard = cool_frame.optimistic_or_unwind()?;
+                                let guard = cool_frame.optimistic_or_unwind()?;
                                 if guard.state != BfState::Cool {
-                                    return Ok(());
+                                    tp!("not cool");
+                                    return Ok(true);
                                 }
 
-                                // TODO check io_map for pid?
+                                if !guard.writting {
+                                    {
+                                        // check io_map for pid
+                                        let map = self.io_map.lock();
+                                        if let Some(slot_ref) = map.get(&guard.pid) {
+                                            let slot_state = slot_ref.try_lock().map(|slot| format!("{:?}", slot.state)).unwrap_or_default();
+                                            tp!("in io_map {:?}", slot_state);
+                                            return Ok(true); // Check bf state for this
+                                        }
+                                    }
 
-                                n_pages_left_to_evict -= 1;
+                                    n_pages_left_to_evict -= 1;
 
-                                if true { // isDirty
-                                    // Add to write buffer
+                                    if guard.is_dirty() { // isDirty
+                                        if !buffer.is_full() {
+                                            // TODO somehow mark it as being in the write buffer (isWB)
+                                            let mut guard = guard.to_exclusive()?;
+                                            assert!(!guard.writting);
+                                            guard.writting = true;
+
+                                            // TODO check if downgrade here is wise (may block
+                                            // readers if there is a queued writer)
+                                            let guard = guard.downgrade();
+
+                                            // TODO out of place
+
+                                            tp!("adding pid = {:?}", guard.pid);
+                                            buffer.add(guard);
+
+                                            error::Result::Ok(true)
+                                        } else {
+                                            tp!("full");
+                                            // break
+                                            Ok(false)
+                                        }
+                                    } else {
+                                        let last_written_gsn = guard.last_written_gsn;
+                                        let gsn = guard.page.gsn;
+                                        guard.recheck()?;
+                                        tp!("clean {} == {}", gsn, last_written_gsn);
+                                        if let Err(e) = evict_frame(guard) {
+                                            // crate::dbg_local_report!();
+                                            return Err(e);
+                                        }
+                                        Ok(true)
+                                    }
                                 } else {
-                                    evict_frame(guard)?;
+                                    // continue
+                                    Ok(true)
                                 }
-
-                                error::Result::Ok(())
                             };
 
                             match try_flush() {
-                                Ok(_) => continue,
+                                Ok(true) => continue,
+                                Ok(false) => {
+                                    tp!("break pushback");
+                                    size_class.cool_frames.push(cool_frame).expect("has space"); // FIXME should we do this?
+                                    break
+                                },
                                 Err(_e) => {
+                                    // Should we giveup writting if it got touched here?
+                                    tp!("pushback");
                                     size_class.cool_frames.push(cool_frame).expect("has space"); // FIXME should we do this?
                                     continue;
                                 } // FIXME check if we can leak a cool frame, maybe push it back
                             }
                         }
                     }
+
+
+                    if n_pages_to_evict > 0 {
+                        buffer.submit();
+                        let _polled_events = buffer.poll_events_sync();
+
+                        for (latch_or_guard, written_gsn) in buffer.done_items() {
+                            let ttl = std::time::Instant::now();
+                            let mut guard = match latch_or_guard {
+                                LatchOrGuard::Latch(latch) => latch.exclusive(),
+                                LatchOrGuard::Guard(guard) => {
+                                    let latch = guard.latch();
+                                    let _ = guard.unlock();
+                                    latch.exclusive()
+                                }
+                            };
+                            tp!("took =========== {:?}", ttl.elapsed());
+                            assert!(guard.writting);
+                            assert!(guard.last_written_gsn < written_gsn);
+
+                            // TODO out of place
+
+                            tp!("Got here {:?} - {:?}", guard.pid, guard.page.gsn);
+
+                            guard.last_written_gsn = written_gsn;
+                            guard.writting = false;
+
+                            if guard.state == BfState::Cool && !guard.is_dirty() {
+                                let cool_frame = guard.latch();
+                                if let Err(_) = evict_frame(guard.unlock()) {
+                                    // println!("But failed");
+                                    size_class.cool_frames.push(cool_frame).expect("has space");
+                                } else {
+                                    tp!("GOOD ----------------");
+                                }
+                            } else if guard.state == BfState::Cool && guard.is_dirty() {
+                                tp!("WHEEET ----------------------");
+                            } else if guard.state == BfState::Reclaim {
+                                size_class.reclaim_page(guard);
+                            }
+                        }
+                    }
                 }
-
-                    // TODO TODO TODO continue pp thread full implementation
-
-//                     let mut try_evict = || {
-//                         while needs_eviction() {
-//                             let mut guard = frame.optimistic_or_unwind()?;
-//                             match guard.state {
-//                                 BfState::Hot => {
-//                                     let dtid = guard.page.dtid;
-//                                     guard.recheck()?;
-//                                     let mut all_evicted = true;
-//                                     let mut picked_child = false;
-//                                     self.registry().get(dtid).expect("exists").iterate_children_swips(&guard, Box::new(|swip| {
-//                                         match swip.try_downcast()? {
-//                                             RefOrPid::Pid(_) => {
-//                                                 guard.recheck()?;
-//                                                 Ok(true)
-//                                             },
-//                                             RefOrPid::Ref(r) => {
-//                                                 all_evicted = false;
-//                                                 frame = r;
-//                                                 guard.recheck()?;
-//                                                 picked_child = true;
-//                                                 Ok(false)
-//                                             }
-//                                         }
-//                                     }))?;
-// 
-//                                     if picked_child {
-//                                         continue;
-//                                     }
-// 
-//                                     if !all_evicted {
-//                                         frame = size_class.random_frame();
-//                                         continue;
-//                                     }
-// 
-//                                     // println!("got candidate for eviction");
-// 
-//                                     let (result, guard) = self.registry().get(dtid).expect("exists").find_parent(guard)?;
-//                                     match result {
-//                                         ParentResult::Root => {
-//                                             // Cannot evict root, restart
-//                                             frame = size_class.random_frame();
-//                                             continue;
-//                                         }
-//                                         ParentResult::Parent(swip_guard) => {
-//                                             let mut swip_x_guard = swip_guard.to_exclusive()?;
-//                                             let mut frame_x_guard = guard.to_exclusive()?;
-//                                             let pid = frame_x_guard.pid;
-// 
-//                                             // FIXME FIXME FIXME the bug is here when we encounter one
-//                                             // of those two bad states, this causes old data to be
-//                                             // resolved somehow
-//                                             //
-//                                             // FIXED FIXED FIXED
-//                                             //
-//                                             // TODO TODO TODO Improve IoSlots and IoMap, current
-//                                             // implementation works but is ugly, cleanup debug mess
-// 
-// 
-//                                             match self.try_with_slot_or_create(pid, IoSlot::new_swizzled(self, pid, frame_x_guard.latch()), |slot_guard, returned| {
-//                                                 match &slot_guard.state {
-//                                                     IoState::Evicted => {
-//                                                         unreachable!("cannot be evicted already");
-//                                                     }
-//                                                     IoState::Loaded(loaded_frame) => {
-//                                                         unreachable!("cannot be loaded already");
-//                                                     }
-//                                                     IoState::Swizzled(_swizzled_frame) => {
-//                                                         swip_x_guard.to_pid(pid);
-//                                                         let _ = swip_x_guard.unlock();
-// 
-//                                                         self.write_page_sync(pid, frame_x_guard.page).expect("failed to write page");
-// 
-//                                                         frame_x_guard.reset();
-// 
-//                                                         let unlocked = frame_x_guard.unlock();
-//                                                         if let Err(e) = size_class.free_frames.push(unlocked.latch()) {
-//                                                             unreachable!("should have space");
-//                                                         }
-// 
-//                                                         slot_guard.state = IoState::Evicted;
-//                                                         // println!("EVICTED! {:?}", pid);
-//                                                         return (true, Ok(()))
-//                                                     }
-//                                                     IoState::Aborted => {
-//                                                         return (true, Err(error::Error::Unwind))
-//                                                     }
-//                                                 }
-//                                             }) {
-//                                                 Some(res) => res?,
-//                                                 None => {
-//                                                     // Could not lock slot
-//                                                     println!("locked?");
-//                                                     frame = size_class.random_frame();
-//                                                     continue;
-//                                                 }
-//                                             };
-//                                         }
-//                                     }
-//                                 }
-//                                 BfState::Loaded => {
-//                                     let pid = guard.pid;
-//                                     guard.recheck()?;
-// 
-//                                     match self.try_with_slot(pid, |slot_guard| {
-//                                         let mut frame_x_guard = match guard.to_exclusive() {
-//                                             Ok(guard) => guard,
-//                                             Err(err) => {
-//                                                 return (false, Err(err));
-//                                             }
-//                                         };
-// 
-//                                         assert_eq!(BfState::Loaded, frame_x_guard.state);
-// 
-//                                         frame_x_guard.reset();
-// 
-//                                         let unlocked = frame_x_guard.unlock();
-//                                         if let Err(e) = size_class.free_frames.push(unlocked.latch()) {
-//                                             unreachable!("should have space");
-//                                         }
-//                                         slot_guard.state = IoState::Evicted;
-//                                         // println!("UNLOADED! {:?}", pid);
-//                                         return (true, Ok(()))
-//                                     }) {
-//                                         None => {
-//                                             // retry, this slot is locked or not found
-//                                             frame = size_class.random_frame();
-//                                             continue;
-//                                         }
-//                                         _ => {}
-//                                     }
-//                                 }
-//                                 _ => {
-//                                     return Err(error::Error::Unwind);
-//                                 }
-//                             }
-//                         }
-// 
-//                         error::Result::Ok(())
-//                     };
-// 
-//                     match try_evict() {
-//                         Ok(_) => break,
-//                         Err(_e) => {
-//                             frame = size_class.random_frame();
-//                             continue;
-//                         }
-//                     }
             }
         }
     }

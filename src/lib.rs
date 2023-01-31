@@ -32,6 +32,8 @@ pub mod util;
 #[cfg(test)]
 pub mod bench;
 
+pub mod persistent;
+
 use latch::{HybridLatch, OptimisticGuard, SharedGuard, ExclusiveGuard, HybridGuard};
 
 /// Type alias for the `GenericBPlusTree` with preset node sizes
@@ -391,6 +393,15 @@ impl<K: Clone + Ord, V, const IC: usize, const LC: usize> GenericBPlusTree<K, V,
 
             // level += 1;
         };
+
+        leaf_guard.recheck()?;
+        if let Some(tree_guard) = t_guard.take() {
+            tree_guard.recheck()?;
+        }
+
+        if let Some((p, _)) = p_guard.as_ref() {
+            p.recheck()?;
+        }
 
         Ok((leaf_guard, p_guard))
     }
@@ -1910,6 +1921,11 @@ impl<K: Clone, V, const INNER_CAPACITY: usize, const LC: usize> InternalNode<K, 
 
         true
     }
+}
+
+#[inline(never)]
+fn debug() {
+    criterion::black_box(());
 }
 
 #[cfg(test)]

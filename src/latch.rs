@@ -59,6 +59,15 @@ use std::fmt;
 
 use crate::error;
 
+macro_rules! tp {
+    ($x:expr) => {
+        // println!("[{:?}] {}", std::thread::current().id(), format!($x));
+    };
+    ($x:expr, $($y:expr),+) => {
+        // println!("[{:?}] {}", std::thread::current().id(), format!($x, $($y),+));
+    };
+}
+
 /// A hybrid latch that uses versioning to enable optimistic, shared or exclusive access to the
 /// underlying data
 pub struct HybridLatch<T: ?Sized> {
@@ -93,6 +102,7 @@ impl<T: ?Sized> HybridLatch<T> {
         let guard = self.lock.write();
         let version = self.version.load(Ordering::Relaxed) + 1;
         self.version.store(version, Ordering::Release);
+        tp!("exc {}", version);
         ExclusiveGuard {
             latch: self,
             guard: Some(guard),
@@ -104,6 +114,11 @@ impl<T: ?Sized> HybridLatch<T> {
     #[inline]
     pub fn is_exclusively_latched(&self) -> bool {
         (self.version.load(Ordering::Acquire) & 1) == 1
+    }
+
+    #[inline]
+    pub fn version(&self) -> usize {
+        self.version.load(Ordering::Acquire)
     }
 
     /// Locks this `HybridLatch` with shared read access, blocking the thread until it can be
@@ -145,7 +160,7 @@ impl<T: ?Sized> HybridLatch<T> {
     /// underlying data. See [`OptimisticGuard::recheck`] for the details.
     ///
     /// Returns an RAII guard which will NOT validate any accesses when dropped.
-    #[inline(never)]
+    #[inline]
     pub fn optimistic_or_spin(&self) -> OptimisticGuard<'_, T> {
         let mut version = self.version.load(Ordering::Acquire);
         if (version & 1) == 1 {
@@ -239,6 +254,7 @@ impl<T: ?Sized> HybridLatch<T> {
             let guard = self.lock.write();
             let version = self.version.load(Ordering::Relaxed) + 1;
             self.version.store(version, Ordering::Release);
+            tp!("opt or exc {}", version);
             OptimisticOrExclusive::Exclusive(ExclusiveGuard {
                 latch: self,
                 guard: Some(guard),
@@ -319,6 +335,7 @@ impl<'a, T: ?Sized, P: ?Sized> OptimisticGuard<'a, T, P> {
     pub fn recheck(&self) -> error::Result<()> {
         debug_assert!((self.version & 1) == 0);
         if self.version != self.latch.version.load(Ordering::Acquire) {
+            // crate::debug();
             return Err(error::Error::Unwind)
         }
         Ok(())
@@ -333,16 +350,17 @@ impl<'a, T: ?Sized, P: ?Sized> OptimisticGuard<'a, T, P> {
         let new_version = self.version + 1;
         let expected = self.version;
         let locked = self.latch.lock.write();
-        if self.latch.version
+        if let Err(v) = self.latch.version
             .compare_exchange(
                 expected,
                 new_version,
                 Ordering::Acquire,
-                Ordering::Acquire).is_err()
+                Ordering::Acquire)
         {
             drop(locked);
             return Err(error::Error::Unwind)
         }
+        tp!("to exc {}", new_version);
 
         Ok(ExclusiveGuard {
             latch: self.latch,
@@ -352,30 +370,30 @@ impl<'a, T: ?Sized, P: ?Sized> OptimisticGuard<'a, T, P> {
         })
     }
 
-    #[inline]
-    pub fn to_exclusive_test(self) -> error::Result<ExclusiveGuard<'a, T, P>> {
-        let new_version = self.version + 1;
-        let expected = self.version;
-        let locked = self.latch.lock.write();
-        if self.latch.version
-            .compare_exchange(
-                expected,
-                new_version,
-                Ordering::Acquire,
-                Ordering::Acquire).is_err()
-        {
-            // println!("got latch but version mismatch");
-            drop(locked);
-            return Err(error::Error::Unwind)
-        }
-
-        Ok(ExclusiveGuard {
-            latch: self.latch,
-            guard: Some(locked),
-            data: self.data as *mut _,
-            version: new_version
-        })
-    }
+//      #[inline]
+//      pub fn to_exclusive_test(self) -> error::Result<ExclusiveGuard<'a, T, P>> {
+//          let new_version = self.version + 1;
+//          let expected = self.version;
+//          let locked = self.latch.lock.write();
+//          if self.latch.version
+//              .compare_exchange(
+//                  expected,
+//                  new_version,
+//                  Ordering::Acquire,
+//                  Ordering::Acquire).is_err()
+//          {
+//              // println!("got latch but version mismatch");
+//              drop(locked);
+//              return Err(error::Error::Unwind)
+//          }
+//
+//          Ok(ExclusiveGuard {
+//              latch: self.latch,
+//              guard: Some(locked),
+//              data: self.data as *mut _,
+//              version: new_version
+//          })
+//      }
 
     /// Tries to acquire shared access after validation of all previous optimistic accesses on
     /// this guard.
@@ -488,9 +506,30 @@ impl<'a, T: ?Sized, P: ?Sized> ExclusiveGuard<'a, T, P> {
         }
     }
 
+    #[inline]
+    pub fn downgrade(mut self) -> SharedGuard<'a, T, P> {
+        let guard = self.guard.take().expect("must exist");
+        let new_version = self.version + 1;
+        let latch = self.latch;
+        let data = self.data;
+        // The version is incremented in drop
+        drop(self);
+        let shared_guard = RwLockWriteGuard::downgrade(guard);
+        SharedGuard {
+            latch,
+            guard: Some(shared_guard),
+            data,
+            version: new_version
+        }
+    }
+
     /// Returns a reference to the original `HybridLatch` struct
     pub fn latch(&self) -> &'a HybridLatch<P> {
         self.latch
+    }
+
+    pub fn as_unmapped_mut(&mut self) -> &mut P {
+        unsafe { &mut *self.latch().data.get() }
     }
 
     pub fn map<U: ?Sized, F>(mut s: Self, f: F) -> ExclusiveGuard<'a, U, P>

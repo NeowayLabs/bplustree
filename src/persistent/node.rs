@@ -1,15 +1,18 @@
 use std::fmt;
 use std::slice;
 
-use crate::bufmgr::{
+use crate::dbg_global_report;
+use crate::persistent::bufmgr::{
     swip::{Swip, Pid},
     BufferFrame
 };
 
-use bplustree::{
+use crate::{
     error::{self, NonOptimisticExt},
     latch::HybridLatch
 };
+
+use super::bufmgr::BufferManager;
 
 
 #[derive(Default, PartialEq, Hash, Copy, Clone)]
@@ -85,7 +88,7 @@ pub struct Node {
     upper_fence: Fence,
     upper_edge: Option<Swip<HybridLatch<BufferFrame>>>,
     hints: [u32; HINT_COUNT],
-    data: Data // Data starts at `addr_of(self.data)` and ends at `addr_of(self.data) + self.capacity` // TODO private
+    pub(crate) data: Data // Data starts at `addr_of(self.data)` and ends at `addr_of(self.data) + self.capacity` // TODO private
 }
 
 impl Node {
@@ -99,12 +102,16 @@ impl Node {
         self.lower_fence = Fence::default();
         self.upper_fence = Fence::default();
         self.upper_edge = None;
-        self.hints = [0u32; 16];
+        self.hints = [0u32; HINT_COUNT];
         // TODO zero out data?
     }
 
+    pub(crate) fn hints(&self) -> &[u32] {
+        &self.hints
+    }
+
     #[inline]
-    pub(crate) fn as_leaf(&self) -> &LeafNode {
+    pub fn as_leaf(&self) -> &LeafNode {
         if self.is_leaf {
             unsafe { std::mem::transmute::<_, &LeafNode>(self) }
         } else {
@@ -113,7 +120,7 @@ impl Node {
     }
 
     #[inline]
-    pub(crate) fn as_internal(&self) -> &InternalNode {
+    pub fn as_internal(&self) -> &InternalNode {
         if !self.is_leaf {
             unsafe { std::mem::transmute::<_, &InternalNode>(self) }
         } else {
@@ -184,17 +191,32 @@ impl Node {
     }
 
     #[inline]
-    pub(crate) fn try_can_merge_with(&self, other: &Self) -> error::Result<bool> {
+    fn calculate_prefix_len(
+        lower_fence_key: Option<&[u8]>,
+        upper_fence_key: Option<&[u8]>) -> usize
+    {
+        let lower_key = lower_fence_key.unwrap_or(&[]);
+        let upper_key = upper_fence_key.unwrap_or(&[]);
+
+        let mut prefix_len = 0;
+        while (prefix_len < lower_key.len().min(upper_key.len())) && (lower_key[prefix_len] == upper_key[prefix_len])
+        {
+            prefix_len += 1;
+        }
+
+        prefix_len
+    }
+
+    #[inline]
+    pub(crate) fn try_can_merge_with(&self, right_node: &Self) -> error::Result<bool> {
         match self.downcast() {
-            NodeKind::Leaf(l) => {
-                let full_space_used = l.used_capacity_after_compaction()
-                    + other.try_leaf()?.used_capacity_after_compaction();
-                Ok(full_space_used < self.capacity)
+            NodeKind::Leaf(left) => {
+                let right = right_node.try_leaf()?;
+                Ok(left.can_merge_with(right))
             },
-            NodeKind::Internal(i) => {
-                let full_space_used = i.used_capacity_after_compaction()
-                    + other.try_internal()?.used_capacity_after_compaction();
-                Ok(full_space_used < self.capacity)
+            NodeKind::Internal(left) => {
+                let right = right_node.try_internal()?;
+                Ok(left.can_merge_with(right))
             }
         }
     }
@@ -204,7 +226,7 @@ impl Node {
         self.is_leaf
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
@@ -235,6 +257,7 @@ impl Node {
         }
     }
 
+    #[inline]
     fn search_hint(&self, head: u32) -> (usize, usize) {
         let mut pos1 = 0;
 
@@ -260,7 +283,9 @@ impl Node {
     #[inline]
     fn sized(&self, offset: usize, len: usize) -> error::Result<&[u8]> {
         let start = offset;
-        let end = start.saturating_add(len);
+        // TODO we should have a capacity mask here
+        let end = start + len;// (start + len).min(self.capacity); // start.saturating_add(len);
+        // let end = (start + len) & 0b0000000000000000000000000000000000000000000000001111111111111111;// (start + len).min(self.capacity);
 
         Ok(self.range(start, end)?)
     }
@@ -268,13 +293,14 @@ impl Node {
     #[inline]
     fn sized_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
         let start = offset;
-        let end = start.saturating_add(len);
+        let end = start + len;// (start + len).min(self.capacity);
 
         self.range_mut(start, end)
     }
 
     #[inline]
     fn range(&self, start: usize, end: usize) -> error::Result<&[u8]> {
+        // debug_assert!(end <= self.capacity);
         if end > self.capacity {
             return Err(error::Error::Unwind);
         }
@@ -316,14 +342,94 @@ impl fmt::Debug for Node {
 }
 
 fn to_head(slice: &[u8]) -> u32 {
-    use std::convert::TryInto;
-
     match slice.len() {
         0 => 0,
         1 => (unsafe { *slice.get_unchecked(0) } as u32) << 24,
-        2 => (u16::from_ne_bytes(slice.try_into().unwrap()).swap_bytes() as u32) << 16,
-        3 => ((u16::from_ne_bytes(slice[..2].try_into().unwrap()).swap_bytes() as u32) << 16) | (unsafe { *slice.get_unchecked(2) } as u32) << 8,
-        _ => u32::from_ne_bytes(slice[..4].try_into().unwrap()).swap_bytes()
+        2 => (
+            u16::from_ne_bytes([
+                unsafe{ *slice.get_unchecked(1) },
+                unsafe{ *slice.get_unchecked(0) }
+            ]) as u32
+        ) << 16,
+        3 => (
+                u16::from_ne_bytes([
+                    unsafe{ *slice.get_unchecked(1) },
+                    unsafe{ *slice.get_unchecked(0) }
+                ]) as u32
+            ) << 16 |
+            (
+                unsafe { *slice.get_unchecked(2) } as u32
+            ) << 8,
+        _ => u32::from_ne_bytes([
+            unsafe{ *slice.get_unchecked(3) },
+            unsafe{ *slice.get_unchecked(2) },
+            unsafe{ *slice.get_unchecked(1) },
+            unsafe{ *slice.get_unchecked(0) }
+        ])
+    }
+}
+
+#[derive(Debug, Default, Hash, PartialEq, Copy, Clone)]
+pub(crate) struct SplitEntryHint<'a> {
+    pub(crate) pos: usize,
+    pub(crate) key: &'a [u8],
+    pub(crate) value_len: usize
+}
+
+#[derive(Debug, Hash, PartialEq, Clone)]
+pub(crate) enum SplitStrategy {
+    SplitAt {
+        key: Vec<u8>,
+        split_pos: usize,
+        new_left_size: Option<usize>,
+        right_size: usize,
+    },
+    Grow {
+        new_size: usize,
+    }
+}
+
+impl SplitStrategy {
+    pub(crate) fn split_key(&self) -> &[u8] {
+        match self {
+            SplitStrategy::SplitAt { key, .. } => key.as_slice(),
+            SplitStrategy::Grow { .. } => &[],
+        }
+    }
+}
+
+
+
+#[derive(Debug, Hash, PartialEq, Clone)]
+pub(crate) enum SplitMeta {
+    AtPos {
+        key: Vec<u8>,
+        at: usize,
+    },
+    BeforePos {
+        key: Vec<u8>,
+        before: usize,
+    }
+}
+
+impl SplitMeta {
+    pub(crate) fn split_key(&self) -> &[u8] {
+        match self {
+            SplitMeta::AtPos { key, .. } => key.as_slice(),
+            SplitMeta::BeforePos { key, .. } => key.as_slice(),
+        }
+    }
+    pub(crate) fn into_split_key(self) -> Vec<u8> {
+        match self {
+            SplitMeta::AtPos { key, .. } => key,
+            SplitMeta::BeforePos { key, .. } => key,
+        }
+    }
+    pub(crate) fn into_parts(self) -> (Vec<u8>, usize, bool) {
+        match self {
+            SplitMeta::AtPos { key, at } => (key, at, true),
+            SplitMeta::BeforePos { key, before } => (key, before, false),
+        }
     }
 }
 
@@ -474,8 +580,13 @@ impl LeafNode {
     }
 
     #[inline]
-    pub(crate) fn lower_bound<K: AsRef<[u8]>>(&self, key: K) -> error::Result<(usize, bool)> {
+    pub fn lower_bound<K: AsRef<[u8]>>(&self, key: K) -> error::Result<(usize, bool)> {
         use std::cmp::Ordering;
+
+//          let first_hint = self.base.hints[0];
+//          if self.base.hints.iter().all(|&h| h == first_hint) {
+//              return self.lower_bound_bench(key);
+//          }
 
         let key = key.as_ref();
         let cmp_len = key.len().min(self.base.prefix_len);
@@ -490,6 +601,43 @@ impl LeafNode {
         }
 
         self.lower_bound_suffix(unsafe { key.get_unchecked(self.base.prefix_len..) })
+    }
+
+    #[inline]
+    pub fn lower_bound_bench<K: AsRef<[u8]>>(&self, key: K) -> error::Result<(usize, bool)> {
+        use std::cmp::Ordering;
+
+        let key = key.as_ref();
+        let cmp_len = key.len().min(self.base.prefix_len);
+        match unsafe { key.get_unchecked(..cmp_len).cmp(self.base.prefix()?) } {
+            Ordering::Less => {
+                return Ok((0, false));
+            }
+            Ordering::Greater => {
+                return Ok((self.base.len, false));
+            }
+            Ordering::Equal => {}
+        }
+
+        let suffix = unsafe { key.get_unchecked(self.base.prefix_len..) };
+
+        let mut lower = 0;
+        let mut upper = self.base.len;
+
+        while lower < upper {
+            let mid = ((upper - lower) / 2) + lower;
+
+            let mid_key = self.key_at(mid)?;
+            if suffix < mid_key {
+                upper = mid;
+            } else if suffix > mid_key {
+                lower = mid + 1;
+            } else {
+                return Ok((mid, true));
+            }
+        }
+
+        Ok((lower, false))
     }
 
     #[inline]
@@ -569,11 +717,11 @@ impl LeafNode {
         }
 
         // TODO remove check?
-        for i in 0..HINT_COUNT {
-            unsafe {
-                assert_eq!(*self.base.hints.get_unchecked(i), self.slots().get_unchecked(dist * (i + 1)).head);
-            }
-        }
+//          for i in 0..HINT_COUNT {
+//              unsafe {
+//                  assert_eq!(*self.base.hints.get_unchecked(i), self.slots().get_unchecked(dist * (i + 1)).head);
+//              }
+//          }
     }
 
     fn space_needed_with_prefix_len(&self, key_len: usize, payload_len: usize, prefix_len: usize) -> usize {
@@ -691,11 +839,26 @@ impl LeafNode {
         let key = key.as_ref();
         let payload = payload.as_ref();
 
+        #[cfg(debug_assertions)]
+        if key.len() == 8 && key.len() == payload.len() && key != payload {
+            let k = to_u64(key);
+            let v = to_u64(payload);
+            crate::dbg_global_report!();
+            crate::dbg_local_report!();
+            println!("wrong kv, key = {}, value = {}", k, v);
+            panic!("boom");
+        }
+
+        #[cfg(debug_assertions)]
         if &key[..self.base.prefix_len] != self.base.prefix().unopt() {
             let lower = to_u64(self.base.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0]));
             let upper = to_u64(self.base.upper_fence().unopt().unwrap_or(&[255, 255, 255, 255, 255, 255, 255, 255]));
             let k = to_u64(key);
             println!("bug upper: {}, lower: {}, k: {}", upper, lower, k);
+            println!("Custom backtrace: {}", std::backtrace::Backtrace::force_capture());
+            crate::dbg_local_report!();
+            crate::dbg_global_report!();
+
             std::process::exit(3);
         }
 
@@ -861,6 +1024,203 @@ impl LeafNode {
 //         }
 //     }
 
+    // FIXME FIXED HERE, FIX THE TREE
+    pub(crate) fn split_heuristic(&self, entry_hint: Option<SplitEntryHint>) -> error::Result<SplitStrategy> {
+        let total_size = match entry_hint {
+            Some(h) => self.used_capacity_after_compaction()
+                + std::mem::size_of::<Slot>() + h.key.len() + h.value_len,
+            None => self.used_capacity_after_compaction(),
+        };
+
+        if self.base.len < 2 {
+            return Ok(SplitStrategy::Grow { new_size: total_size });
+        }
+
+        let mut left_used_space = 0;
+        let mut candidates = vec![];
+
+        for i in 0..(self.base.len - 1) {
+            let size = match entry_hint {
+                Some(entry_hint) if entry_hint.pos == i => {
+                    // FIXME there is no way currently to prevent the new entry to end in the same
+                    // node as the entry of the hint position (from lower_bound), if those two
+                    // entries are too large for the node, this could in theory cause a split
+                    // recursion because we cannot split before 0 position
+
+                    std::mem::size_of::<Slot>() + entry_hint.key.len() + entry_hint.value_len
+                        + std::mem::size_of::<Slot>() + self.kv_len(i)?
+                }
+                _ => {
+                    std::mem::size_of::<Slot>() + self.kv_len(i)?
+                }
+            };
+
+            if i >= (self.base.len - 1) {
+                // Read past len, unwind
+                return Err(error::Error::Unwind);
+            }
+
+            left_used_space += size;
+
+
+//              if used_space + size <= self.base.capacity {
+//                  used_space += size;
+//              } else {
+//                  break;
+//              }
+
+            // TODO check if we should allow shrinking capacity
+            let left_capacity = if left_used_space <= self.base.capacity {
+                self.base.capacity
+            } else {
+                BufferManager::capacity_for::<Node>(left_used_space)
+            };
+
+            let left_utilization = left_used_space as f32 / left_capacity as f32 * 100.0;
+            let left_capacity_ratio = left_capacity as f32 / self.base.capacity as f32;
+
+            let right_used_space = total_size - left_used_space;
+
+            let right_capacity = BufferManager::capacity_for::<Node>(right_used_space);
+            let right_utilization = right_used_space as f32 / right_capacity as f32 * 100.0;
+            let right_capacity_ratio = right_capacity as f32 / self.base.capacity as f32;
+
+            let delta_utilization = (left_utilization - right_utilization).abs();
+            let max_utilization = left_utilization.max(right_utilization);
+
+            candidates.push((left_capacity_ratio, right_capacity_ratio, delta_utilization, max_utilization, left_used_space, right_used_space, i));
+
+
+//              println!("l_used = {}, r_used = {}", used_space, right_used_space);
+//              println!("l_util = {:.0}%, r_util = {:.0}%", left_utilization, right_utilization);
+//              println!("delta = {}, cap_ratio = {}", delta_utilization, capacity_ratio);
+        }
+
+
+        candidates
+            .sort_by(|a, b| (a.0, a.1, a.2, a.3)
+                     .partial_cmp(&(b.0, b.1, b.2, b.3)).unwrap());
+
+        let best_candidate = *candidates.iter()
+            .filter(|(_, _, _, max_util, _, _, _)| *max_util < 90.0)
+            .nth(0)
+            .unwrap_or(candidates.first().expect("must have one"));
+
+        let (_, _, _, _, left_node_size, right_node_size, split_pos) = best_candidate;
+
+        let key = self.full_key_at(split_pos)?;
+
+        let new_left_size = if left_node_size > self.base.capacity {
+            Some(left_node_size)
+        } else {
+            None
+        };
+
+//          #[cfg(debug_assertions)]
+//          {
+//              let lower = self.base.lower_fence()?.unwrap_or(&[]);
+//              let upper = self.base.upper_fence()?.unwrap_or(&[]);
+//              if key == lower || key == upper {
+//                  println!("candidates: {:?}", candidates);
+//                  println!("bad split position (at {}), will duplicate fences: key = {}, lower = {}, upper = {}", split_pos, to_u64(&key), to_u64(lower), to_u64(upper));
+//
+//                  panic!("at dup"); // FIXME needs recheck before this
+//              }
+//          }
+
+        Ok(SplitStrategy::SplitAt { key, split_pos, new_left_size, right_size: right_node_size })
+    }
+
+    pub(crate) fn split_large(&mut self, right: &mut LeafNode, new_left: Option<&mut LeafNode>, strategy: &SplitStrategy) {
+        let stored_len = self.base.len;
+
+        match strategy {
+            SplitStrategy::SplitAt { key, split_pos, new_left_size, right_size } => {
+
+                match new_left {
+                    Some(left) => {
+                        let split_key = key.as_slice();
+
+                        left.set_fences(self.base.lower_fence().unopt(), Some(split_key));
+                        assert!(right.base.len == 0);
+                        right.set_fences(Some(split_key), self.base.upper_fence().unopt());
+                        self.copy_key_value_range(0, left, 0, split_pos + 1).unopt();
+                        self.copy_key_value_range(split_pos + 1, right, 0, self.base.len - (split_pos + 1)).unopt();
+
+                        left.make_hint();
+                        right.make_hint();
+
+                        // right.check_node();
+
+                        // left.check_node();
+                        assert!(stored_len == left.base.len + right.base.len);
+                    }
+                    None => {
+                        // self.check_node();
+                        let split_key = key.as_slice();
+
+                        let mut left_node = BoxedNode::new(true, self.base.capacity);
+                        let left = left_node.as_leaf_mut();
+                        left.set_fences(self.base.lower_fence().unopt(), Some(split_key));
+                        assert!(right.base.len == 0);
+                        right.set_fences(Some(split_key), self.base.upper_fence().unopt());
+                        self.copy_key_value_range(0, left, 0, split_pos + 1).unopt();
+                        self.copy_key_value_range(split_pos + 1, right, 0, self.base.len - (split_pos + 1)).unopt();
+
+                        left.make_hint();
+                        right.make_hint();
+
+                        // right.check_node();
+
+                        left_node.copy_to(&mut self.base);
+                        // self.check_node();
+                        assert!(stored_len == self.base.len + right.base.len);
+                    }
+                }
+            },
+            _ => {
+                unreachable!("must be a split");
+            }
+        }
+    }
+
+    pub(crate) fn copy_to(&mut self, other: &mut LeafNode) {
+        let stored_len = self.base.len;
+
+        other.set_fences(self.base.lower_fence().unopt(), self.base.upper_fence().unopt());
+        debug_assert!(other.base.len == 0);
+        self.copy_key_value_range(0, other, 0, self.base.len).unopt();
+
+        other.make_hint();
+
+        assert!(stored_len == other.base.len);
+    }
+
+    pub(crate) fn split_pre(&mut self, right: &mut LeafNode, split_meta: &SplitMeta) {
+        let stored_len = self.base.len;
+        // self.check_node();
+        let (split_key, split_pos) = match split_meta {
+            SplitMeta::AtPos { key, at } => (key.as_slice(), at + 1),
+            SplitMeta::BeforePos { key, before } => (key.as_slice(), *before)
+        };
+        let mut left_node = BoxedNode::new(true, self.base.capacity);
+        let left = left_node.as_leaf_mut();
+        left.set_fences(self.base.lower_fence().unopt(), Some(split_key));
+        assert!(right.base.len == 0);
+        right.set_fences(Some(split_key), self.base.upper_fence().unopt());
+        self.copy_key_value_range(0, left, 0, split_pos).unopt();
+        self.copy_key_value_range(split_pos, right, 0, self.base.len - split_pos).unopt();
+
+        left.make_hint();
+        right.make_hint();
+
+        // right.check_node();
+
+        left_node.copy_to(&mut self.base);
+        // self.check_node();
+        assert!(stored_len == self.base.len + right.base.len);
+    }
+
     pub(crate) fn split(&mut self, right: &mut LeafNode, split_pos: usize) {
         let stored_len = self.base.len;
         // self.check_node();
@@ -883,19 +1243,41 @@ impl LeafNode {
         assert!(stored_len == self.base.len + right.base.len);
     }
 
+    #[inline]
+    pub(crate) fn can_merge_with(&self, right: &LeafNode) -> bool {
+        let left = self;
+        let new_prefix_len = Node::calculate_prefix_len(
+            left.base.lower_fence().unopt(),
+            right.base.upper_fence().unopt()
+            );
+
+        let left_grow = (left.base.prefix_len - new_prefix_len) * left.base.len;
+        let right_grow = (right.base.prefix_len - new_prefix_len) * right.base.len;
+
+        let space_upper_bound = left.base.space_used + right.base.space_used
+            + (std::mem::size_of::<Slot>() * (left.base.len + right.base.len))
+            + left_grow + right_grow;
+
+        space_upper_bound <= left.base.capacity
+    }
+
     pub(crate) fn merge(&mut self, right: &mut LeafNode) -> bool {
         // self.check_node();
         // right.check_node();
+
+        // FIXME determine if we should reject merging if the right node is smaller than ourselves,
+        // so that the larger nodes get reclaimed eventualy
+
+        if !self.can_merge_with(&right) {
+            return false;
+        }
+
+        // TODO check if we should allocate a node with a different capacity (done: we cannot
+        // allocate different sizes here)
+
         let mut tmp_node = BoxedNode::new(true, self.base.capacity);
         let tmp = tmp_node.as_leaf_mut();
         tmp.set_fences(self.base.lower_fence().unopt(), right.base.upper_fence().unopt());
-        let left_grow = (self.base.prefix_len - tmp.base.prefix_len) * self.base.len;
-        let right_grow = (right.base.prefix_len - tmp.base.prefix_len) * right.base.len;
-        let space_upper_bound = self.base.space_used + right.base.space_used + (std::mem::size_of::<Slot>() * (self.base.len + right.base.len)) + left_grow + right_grow;
-        // TODO check if we should allocate a node with a different capacity
-        if space_upper_bound > self.base.capacity {
-            return false;
-        }
 
         self.copy_key_value_range(0, tmp, 0, self.base.len).unopt();
         right.copy_key_value_range(0, tmp, self.base.len, right.base.len).unopt();
@@ -1064,8 +1446,13 @@ impl InternalNode {
     }
 
     #[inline]
-    pub(crate) fn lower_bound<K: AsRef<[u8]>>(&self, key: K) -> error::Result<(usize, bool)> {
+    pub fn lower_bound<K: AsRef<[u8]>>(&self, key: K) -> error::Result<(usize, bool)> {
         use std::cmp::Ordering;
+
+//          let first_hint = self.base.hints[0];
+//          if self.base.hints.iter().all(|&h| h == first_hint) {
+//              return self.lower_bound_bench(key);
+//          }
 
         let key = key.as_ref();
         let cmp_len = key.len().min(self.base.prefix_len);
@@ -1080,6 +1467,43 @@ impl InternalNode {
         }
 
         self.lower_bound_suffix(unsafe { key.get_unchecked(self.base.prefix_len..) })
+    }
+
+    #[inline]
+    pub fn lower_bound_bench<K: AsRef<[u8]>>(&self, key: K) -> error::Result<(usize, bool)> {
+        use std::cmp::Ordering;
+
+        let key = key.as_ref();
+        let cmp_len = key.len().min(self.base.prefix_len);
+        match unsafe { key.get_unchecked(..cmp_len).cmp(self.base.prefix()?) } {
+            Ordering::Less => {
+                return Ok((0, false));
+            }
+            Ordering::Greater => {
+                return Ok((self.base.len, false));
+            }
+            Ordering::Equal => {}
+        }
+
+        let suffix = unsafe { key.get_unchecked(self.base.prefix_len..) };
+
+        let mut lower = 0;
+        let mut upper = self.base.len;
+
+        while lower < upper {
+            let mid = ((upper - lower) / 2) + lower;
+
+            let mid_key = self.key_at(mid)?;
+            if suffix < mid_key {
+                upper = mid;
+            } else if suffix > mid_key {
+                lower = mid + 1;
+            } else {
+                return Ok((mid, true));
+            }
+        }
+
+        Ok((lower, false))
     }
 
     #[inline]
@@ -1159,11 +1583,11 @@ impl InternalNode {
         }
 
         // TODO remove check?
-        for i in 0..HINT_COUNT {
-            unsafe {
-                assert_eq!(*self.base.hints.get_unchecked(i), self.slots().get_unchecked(dist * (i + 1)).head);
-            }
-        }
+//          for i in 0..HINT_COUNT {
+//              unsafe {
+//                  assert_eq!(*self.base.hints.get_unchecked(i), self.slots().get_unchecked(dist * (i + 1)).head);
+//              }
+//          }
     }
 
     fn space_needed_with_prefix_len(&self, key_len: usize, prefix_len: usize) -> usize {
@@ -1280,7 +1704,7 @@ impl InternalNode {
         }
 
         self.base.sized_mut(self.base.data_offset, key_len).copy_from_slice(key_suffix);
-        assert!(self.base.data_offset >= std::mem::size_of::<Slot>() * self.base.len);
+        assert!(self.base.data_offset >= std::mem::size_of::<InnerSlot>() * self.base.len);
     }
 
     fn copy_key_value_range(&self, src_pos: usize, dst: &mut InternalNode, dst_pos: usize, amount: usize) -> error::Result<()> {
@@ -1428,24 +1852,38 @@ impl InternalNode {
         // self.check_node();
     }
 
+    #[inline]
+    pub(crate) fn can_merge_with(&self, right: &InternalNode) -> bool {
+        let left = self;
+        let new_prefix_len = Node::calculate_prefix_len(
+            left.base.lower_fence().unopt(),
+            right.base.upper_fence().unopt()
+        );
+
+        let left_grow = (left.base.prefix_len - new_prefix_len) * left.base.len;
+        let right_grow = (right.base.prefix_len - new_prefix_len) * right.base.len;
+
+        let extra_key_len = right.base.lower_fence.len;
+
+        let space_upper_bound = left.base.space_used + right.base.space_used
+            + (std::mem::size_of::<InnerSlot>() * (left.base.len + right.base.len))
+            + left_grow + right_grow
+            + extra_key_len;
+
+        space_upper_bound <= left.base.capacity
+    }
+
     pub(crate) fn merge(&mut self, right: &mut InternalNode) -> bool {
         // self.check_node();
+
+        if !self.can_merge_with(&right) {
+            return false;
+        }
+
         let mut tmp_node = BoxedNode::new(false, self.base.capacity);
         let tmp = tmp_node.as_internal_mut();
         tmp.set_fences(self.base.lower_fence().unopt(), right.base.upper_fence().unopt());
-        let left_grow = (self.base.prefix_len - tmp.base.prefix_len) * self.base.len;
-        let right_grow = (right.base.prefix_len - tmp.base.prefix_len) * right.base.len;
         let extra_key = right.base.lower_fence().unopt().expect("lower fence must exist");
-        let space_upper_bound = self.base.space_used
-            + right.base.space_used
-            + (std::mem::size_of::<Slot>() * (self.base.len + right.base.len))
-            + left_grow
-            + right_grow
-            + self.space_needed(extra_key.len());
-        // TODO check if we should allocate a node with a different capacity
-        if space_upper_bound > self.base.capacity {
-            return false;
-        }
 
         // Copy left contents
         self.copy_key_value_range(0, tmp, 0, self.base.len).unopt();
@@ -1468,7 +1906,9 @@ impl InternalNode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, LeafNode, BoxedNode};
+    use crate::{error::NonOptimisticExt, persistent::node::SplitMeta};
+
+    use super::{Node, LeafNode, BoxedNode, Slot, SplitEntryHint};
 
     #[test]
     fn persistent_leaf_node_insert() {
@@ -1496,5 +1936,66 @@ mod tests {
         assert!(leaf.base.len == 0);
 
         assert!(leaf.lower_bound(b"0001").unwrap() == (0, false));
+    }
+
+    #[test]
+    fn persistent_leaf_node_split_heuristic() {
+        let mut node = BoxedNode::new(true, 128 * 1024);
+        let leaf = node.as_leaf_mut();
+
+        for i in 0..9 {
+            let key_len = 8;
+            let val_len = if i == 8 {
+                (8 * 8192) - (key_len + std::mem::size_of::<Slot>())
+            } else {
+                8192 - (key_len + std::mem::size_of::<Slot>())
+            };
+            leaf.insert(format!("{:08}", i).as_bytes(), b"A".repeat(val_len)).unwrap();
+        }
+
+        let result = leaf.split_heuristic(None).unopt();
+
+        println!("result = {:?}", result);
+        // TODO assert_eq!((SplitMeta::AtPos { key: b"00000007".to_vec(), at: 7 }, 65536), result);
+
+        println!("With entry hint");
+        let mut node = BoxedNode::new(true, 128 * 1024);
+        let leaf = node.as_leaf_mut();
+
+        for i in 0..9 {
+            let key_len = 8;
+            let val_len = if i == 8 {
+                (8 * 8192) - (key_len + std::mem::size_of::<Slot>())
+            } else {
+                8192 - (key_len + std::mem::size_of::<Slot>())
+            };
+            leaf.insert(format!("{:08}", i).as_bytes(), b"A".repeat(val_len)).unwrap();
+        }
+
+        let result = leaf.split_heuristic(Some(SplitEntryHint {
+            pos: 0, key: b"00000000", value_len: (8 * 8192) - (8 + std::mem::size_of::<Slot>())
+        })).unopt();
+
+        println!("result = {:?}", result);
+        // TODO assert_eq!((SplitMeta::AtPos { key: b"00000003".to_vec(), at: 3 }, 98280), result);
+
+        println!("Simple split");
+        let mut node = BoxedNode::new(true, 64 * 1024);
+        let leaf = node.as_leaf_mut();
+
+        for i in 0..8 {
+            let key_len = 8;
+            let val_len = 8192 - (key_len + std::mem::size_of::<Slot>());
+            leaf.insert(format!("{:08}", i).as_bytes(), b"A".repeat(val_len)).unwrap();
+        }
+
+        let result = leaf.split_heuristic(Some(SplitEntryHint {
+            pos: 0,
+            key: b"00000000",
+            value_len: 8192 - (8 + std::mem::size_of::<Slot>())
+        })).unopt();
+
+        println!("result = {:?}", result);
+        // TODO assert_eq!((SplitMeta::AtPos { key: b"00000002".to_vec(), at: 2 }, 40936), result);
     }
 }

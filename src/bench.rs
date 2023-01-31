@@ -11,6 +11,33 @@ mod benchmark {
 
     use serial_test::serial;
 
+    const TIMING: bool = true;
+
+    macro_rules! start {
+        ($val:ident) => {
+            let $val = if TIMING {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+        };
+    }
+
+    macro_rules! end {
+        ($val:ident) => {
+            if TIMING {
+                let $val = $val.as_ref().unwrap();
+                dbg!($val.elapsed());
+            }
+        };
+        ($val:ident, $ex:expr) => {
+            if TIMING {
+                let $val = $val.as_ref().unwrap();
+                dbg!($val.elapsed(), $ex);
+            }
+        };
+    }
+
     #[derive(Clone)]
     struct Workload {
         size: usize,
@@ -370,27 +397,32 @@ mod benchmark {
         use rand::seq::SliceRandom;
 
         let empty = false;
-        let n_ops = 8000000;
-        let n_threads = 8;
+        let n_ops = 1000000;
+        let n_threads = 1;
         let ops_per_thread = n_ops / n_threads;
-        let weights = [20.0, 20.0, 55.0, 5.0, 0.00];
+        // ops: [insert, remove, lookup, scan, full_scan]
+        let weights = [0.0, 0.0, 100.0, 0.0, 0.00];
 
         println!("{}", ops_per_thread);
 
         let barrier = Arc::new(Barrier::new(n_threads + 1));
         let total_num_operations = Arc::new(AtomicUsize::new(0));
 
-        let treeindex: Arc<GenericBPlusTree<usize, usize, 128, 256>> = Arc::new(GenericBPlusTree::new());
+        type MapKV = [u8; 8];
+
+        let treeindex: Arc<GenericBPlusTree<MapKV, MapKV, 1536, 1536>> = Arc::new(GenericBPlusTree::new());
 
         if !empty {
             let mut rng = thread_rng();
             let mut data: Vec<usize> = (0..ops_per_thread).collect();
             data.shuffle(&mut rng);
 
+            start!(t_insert);
             for i in 0..ops_per_thread {
                 let mut iter = treeindex.raw_iter_mut();
-                iter.insert(data[i], data[i]);
+                iter.insert(data[i].to_be_bytes(), data[i].to_be_bytes());
             }
+            end!(t_insert);
         }
 
         let mut handles = vec![];
@@ -412,20 +444,22 @@ mod benchmark {
                     match choices[i] {
                         0 => {
                             let mut iter = treeindex.raw_iter_mut();
-                            iter.insert(data[i], data[i]);
+                            iter.insert(data[i].to_be_bytes(), data[i].to_be_bytes());
                             n_operations += 1;
                         }
                         1 => {
-                            let _ = treeindex.remove(&data[i]);
+                            let _ = treeindex.remove(&data[i].to_be_bytes());
                             n_operations += 1;
                         }
                         2 => {
-                            let _ = treeindex.lookup(&data[i], |_| ());
+                            // start!(t_lookup);
+                            let _ = treeindex.lookup(&data[i].to_be_bytes(), |_| ());
+                            // end!(t_lookup);
                             n_operations += 1;
                         }
                         3 => {
                             let mut scanner = treeindex.raw_iter();
-                            scanner.seek(&data[i]);
+                            scanner.seek(&data[i].to_be_bytes());
                             let mut scanned = 0;
                             while let Some(_) = scanner.next() {
                                 scanned += 1;

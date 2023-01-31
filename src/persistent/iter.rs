@@ -1,6 +1,8 @@
-use crate::tree::{PersistentBPlusTree, OptNodeGuard, ShrNodeGuard, ExvNodeGuard, Direction, swip_to_node_guard, bf_to_node_guard};
-use bplustree::latch::{OptimisticGuard, SharedGuard, ExclusiveGuard};
+use crate::persistent::node::SplitEntryHint;
+use crate::persistent::tree::{PersistentBPlusTree, OptNodeGuard, ShrNodeGuard, ExvNodeGuard, Direction, swip_to_node_guard, bf_to_node_guard};
+use crate::latch::{OptimisticGuard, SharedGuard, ExclusiveGuard};
 use crate::error::{self, NonOptimisticExt};
+use crate::persistent::bufmgr::latch_ext::BfOptimisticGuardExt;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum Cursor {
@@ -100,7 +102,7 @@ impl <'t> RawSharedIter<'t> {
             };
             if let Some(pos) = bounded_pos {
                 let swip_guard = OptimisticGuard::map(parent_guard, |node| node.try_internal()?.edge_at(pos))?;
-                let (swip_guard, guard) = PersistentBPlusTree::lock_coupling(swip_guard)?;
+                let (swip_guard, guard) = PersistentBPlusTree::lock_coupling(self.tree.bufmgr, swip_guard)?;
                 parent_guard = swip_to_node_guard(swip_guard);
 
                 assert!(guard.is_leaf());
@@ -423,12 +425,12 @@ impl <'t> RawExclusiveIter<'t> {
             };
             if let Some(pos) = bounded_pos {
                 let swip_guard = OptimisticGuard::map(parent_guard, |node| node.try_internal()?.edge_at(pos))?;
-                let (swip_guard, guard) = PersistentBPlusTree::lock_coupling(swip_guard)?;
+                let (swip_guard, guard) = PersistentBPlusTree::lock_coupling(self.tree.bufmgr, swip_guard)?;
                 parent_guard = swip_to_node_guard(swip_guard);
 
                 assert!(guard.is_leaf());
 
-                let exclusive_guard = guard.to_exclusive()?;
+                let exclusive_guard = guard.to_exclusive_bf()?;
 
                 let l_cursor = match direction {
                     Direction::Forward => Cursor::Before(0),
@@ -716,14 +718,25 @@ impl <'t> RawExclusiveIter<'t> {
                 } else {
                     tp!("cant insert");
                     self.parent.take();
-                    let (guard, _cursor) = self.leaf.take().expect("just seeked");
+                    let (guard, cursor) = self.leaf.take().expect("just seeked");
                     let mut guard = guard.unlock();
 
                     loop {
                         let perform_split = || {
                             if !guard.as_leaf().can_insert(key.len(), value.len()) {
+                                let pos = match cursor {
+                                    Cursor::Before(pos) => pos,
+                                    _ => unreachable!("seek_exact always sets cursor to before")
+                                };
                                 guard.recheck()?;
-                                self.tree.try_split(&guard)?;
+                                self.tree.try_split(
+                                    &guard,
+                                    Some(SplitEntryHint {
+                                        pos,
+                                        key,
+                                        value_len: value.len()
+                                    })
+                                )?;
                             }
                             error::Result::Ok(())
                         };
@@ -829,8 +842,8 @@ impl <'t> RawExclusiveIter<'t> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tree::{PersistentBPlusTree};
-    use crate::ensure_global_bufmgr;
+    use crate::persistent::tree::{PersistentBPlusTree};
+    use crate::persistent::ensure_global_bufmgr;
 
     use super::{RawExclusiveIter};
     use serial_test::serial;
