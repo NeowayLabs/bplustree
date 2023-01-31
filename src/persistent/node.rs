@@ -1040,7 +1040,7 @@ impl LeafNode {
         // let mut candidates = vec![];
 
         let n_split_candidates = 64;
-        let split_step = self.base.len / n_split_candidates;
+        let split_step = (self.base.len / n_split_candidates).max(1);
 
         type Split = ((f32, f32, f32, f32), (usize, usize, usize));
         let mut best_valid_split: Option<Split> = None;
