@@ -1037,12 +1037,19 @@ impl LeafNode {
         }
 
         let mut left_used_space = 0;
-        let mut candidates = vec![];
+        // let mut candidates = vec![];
+
+        let n_split_candidates = 64;
+        let split_step = self.base.len / n_split_candidates;
+
+        type Split = ((f32, f32, f32, f32), (usize, usize, usize));
+        let mut best_valid_split: Option<Split> = None;
+        let mut best_split: Option<Split> = None;
 
         for i in 0..(self.base.len - 1) {
             let size = match entry_hint {
                 Some(entry_hint) if entry_hint.pos == i => {
-                    // FIXME there is no way currently to prevent the new entry to end in the same
+                    // FIXME(done?) there is no way currently to prevent the new entry to end in the same
                     // node as the entry of the hint position (from lower_bound), if those two
                     // entries are too large for the node, this could in theory cause a split
                     // recursion because we cannot split before 0 position
@@ -1055,9 +1062,10 @@ impl LeafNode {
                 }
             };
 
-            if i >= (self.base.len - 1) {
-                // Read past len, unwind
-                return Err(error::Error::Unwind);
+            if i + 1 >= self.base.len || left_used_space + size > total_size { // FIXME improve ub detection
+                // Read past len || size grew while computing heuristic
+                // Unwinding
+                return Err(error::Error::Unwind)
             }
 
             left_used_space += size;
@@ -1069,44 +1077,68 @@ impl LeafNode {
 //                  break;
 //              }
 
-            // TODO check if we should allow shrinking capacity
-            let left_capacity = if left_used_space <= self.base.capacity {
-                self.base.capacity
-            } else {
-                BufferManager::capacity_for::<Node>(left_used_space)
-            };
+            if i % split_step == 0 {
+                // TODO check if we should allow shrinking capacity
+                let left_capacity = if left_used_space <= self.base.capacity {
+                    self.base.capacity
+                } else {
+                    BufferManager::capacity_for::<Node>(left_used_space)
+                };
 
-            let left_utilization = left_used_space as f32 / left_capacity as f32 * 100.0;
-            let left_capacity_ratio = left_capacity as f32 / self.base.capacity as f32;
+                let left_utilization = left_used_space as f32 / left_capacity as f32 * 100.0;
+                let left_capacity_ratio = left_capacity as f32 / self.base.capacity as f32;
 
-            let right_used_space = total_size - left_used_space;
+                let right_used_space = total_size - left_used_space;
 
-            let right_capacity = BufferManager::capacity_for::<Node>(right_used_space);
-            let right_utilization = right_used_space as f32 / right_capacity as f32 * 100.0;
-            let right_capacity_ratio = right_capacity as f32 / self.base.capacity as f32;
+                let right_capacity = BufferManager::capacity_for::<Node>(right_used_space);
+                let right_utilization = right_used_space as f32 / right_capacity as f32 * 100.0;
+                let right_capacity_ratio = right_capacity as f32 / self.base.capacity as f32;
 
-            let delta_utilization = (left_utilization - right_utilization).abs();
-            let max_utilization = left_utilization.max(right_utilization);
+                let delta_utilization = (left_utilization - right_utilization).abs();
+                let max_utilization = left_utilization.max(right_utilization);
 
-            candidates.push((left_capacity_ratio, right_capacity_ratio, delta_utilization, max_utilization, left_used_space, right_used_space, i));
+                // candidates.push((left_capacity_ratio, right_capacity_ratio, delta_utilization, max_utilization, left_used_space, right_used_space, i));
+                let candidate_split = ((left_capacity_ratio, right_capacity_ratio, delta_utilization, max_utilization), (left_used_space, right_used_space, i));
 
+                if let Some(split) = best_split {
+                    if candidate_split.0 < split.0 {
+                        best_split = Some(candidate_split);
+                    }
+                } else {
+                    best_split = Some(candidate_split);
+                }
 
-//              println!("l_used = {}, r_used = {}", used_space, right_used_space);
-//              println!("l_util = {:.0}%, r_util = {:.0}%", left_utilization, right_utilization);
-//              println!("delta = {}, cap_ratio = {}", delta_utilization, capacity_ratio);
+                if max_utilization < 90.0 {
+                    if let Some(split) = best_valid_split {
+                        if candidate_split.0 < split.0 {
+                            best_valid_split = Some(candidate_split);
+                        }
+                    } else {
+                        best_valid_split = Some(candidate_split);
+                    }
+                }
+
+//                  println!("l_used = {}, r_used = {}", used_space, right_used_space);
+//                  println!("l_util = {:.0}%, r_util = {:.0}%", left_utilization, right_utilization);
+//                  println!("delta = {}, cap_ratio = {}", delta_utilization, capacity_ratio);
+            }
         }
 
 
-        candidates
-            .sort_by(|a, b| (a.0, a.1, a.2, a.3)
-                     .partial_cmp(&(b.0, b.1, b.2, b.3)).unwrap());
+//          candidates
+//              .sort_by(|a, b| (a.0, a.1, a.2, a.3)
+//                       .partial_cmp(&(b.0, b.1, b.2, b.3)).unwrap());
+//
+//          let best_candidate = *candidates.iter()
+//              .filter(|(_, _, _, max_util, _, _, _)| *max_util < 90.0)
+//              .nth(0)
+//              .unwrap_or(candidates.first().expect("must have one"));
+//
+//          let (_, _, _, _, left_node_size, right_node_size, split_pos) = best_candidate;
 
-        let best_candidate = *candidates.iter()
-            .filter(|(_, _, _, max_util, _, _, _)| *max_util < 90.0)
-            .nth(0)
-            .unwrap_or(candidates.first().expect("must have one"));
+        let best_candidate = best_valid_split.or(best_split).expect("must have one");
 
-        let (_, _, _, _, left_node_size, right_node_size, split_pos) = best_candidate;
+        let (_, (left_node_size, right_node_size, split_pos)) = best_candidate;
 
         let key = self.full_key_at(split_pos)?;
 
