@@ -29,10 +29,12 @@ struct BufferStorage {
     alignment_offset: usize,
     storage: Box<[u8]>,
     size: usize,
+    iovec: libc::iovec,
 }
 
 struct GuardStorage {
     guard: Option<SharedGuard<'static, BufferFrame>>,
+    iovec: Option<libc::iovec>,
 }
 
 pub(crate) enum LatchOrGuard {
@@ -59,6 +61,17 @@ impl Slot {
         }
     }
 
+    fn slot_iovec(&self) -> &libc::iovec {
+        match self.storage {
+            Storage::Buffer(ref stg) => {
+                &stg.iovec
+            }
+            Storage::Guard(ref stg) => {
+                stg.iovec.as_ref().expect("exists")
+            }
+        }
+    }
+
     fn to_ready(&mut self, guard: SharedGuard<'static, BufferFrame>) {
         match self.state {
             State::Free => {
@@ -77,6 +90,11 @@ impl Slot {
                         storage[stg.alignment_offset..(stg.alignment_offset + stg.size)].copy_from_slice(guard.page_bytes());
                     }
                     Storage::Guard(ref mut stg) => {
+                        let iovec = libc::iovec {
+                            iov_base: guard.page_bytes().as_ptr() as *mut _,
+                            iov_len: guard.page_bytes().len(),
+                        };
+                        stg.iovec = Some(iovec);
                         stg.guard = Some(guard);
                     }
                 }
@@ -114,6 +132,7 @@ impl Slot {
                 match self.storage {
                     Storage::Guard(ref mut stg) => {
                         stg.guard.take();
+                        stg.iovec.take();
                     }
                     _ => {}
                 }
@@ -164,10 +183,14 @@ impl WriteBuffer {
             free_slots.push(i).unwrap();
 
             let storage = if use_guard {
-                Storage::Guard(GuardStorage { guard: None })
+                Storage::Guard(GuardStorage { guard: None, iovec: None })
             } else {
                 let (alignment_offset, storage) = aligned_boxed_slice(slot_size, 512);
-                Storage::Buffer(BufferStorage { alignment_offset, storage, size: slot_size })
+                let iovec = libc::iovec {
+                    iov_base: storage[alignment_offset..(alignment_offset + slot_size)].as_ptr() as *mut _,
+                    iov_len: slot_size,
+                };
+                Storage::Buffer(BufferStorage { alignment_offset, storage, size: slot_size, iovec })
             };
 
             slots.push(Slot {
@@ -209,10 +232,12 @@ impl WriteBuffer {
 
         slot.to_ready(guard);
 
-        let entry = io_uring::opcode::Write::new(
+        let entry = io_uring::opcode::Writev::new(
             io_uring::types::Fd(self.fd),
-            slot.slot_bytes().as_ptr(),
-            slot.slot_bytes().len().try_into().expect("too large")
+            // slot.slot_bytes().as_ptr(),
+            // slot.slot_bytes().len().try_into().expect("too large")
+            slot.slot_iovec() as * const _,
+            1
         )
             .offset(slot.meta.expect("exists").pid.page_id().try_into().expect("too large"))
             .build()
@@ -239,7 +264,7 @@ impl WriteBuffer {
 
             let slot = &mut self.slots[slot_idx];
             // println!("result = {}", result);
-            assert_eq!(slot.slot_bytes().len(), result as usize);
+            assert_eq!(slot.slot_bytes().len() as i32, result);
             assert_eq!(State::Pending, slot.state);
 
             slot.to_done();
