@@ -49,15 +49,15 @@ mod benchmark {
         use rand::distributions::WeightedIndex;
         use rand::seq::SliceRandom;
 
-        ensure_global_bufmgr("/dev/shm/state.db", 1024 * 1024 * 1024).unwrap();
+        ensure_global_bufmgr("/dev/shm/state.db", 80 * 1024 * 1024).unwrap();
 
         let empty = false;
-        let n_ops = 1000000 * 15;
-        let n_threads = 15;
+        let n_ops = 1000000 * 7;
+        let n_threads = 7;
         let ops_per_thread = n_ops / n_threads;
         // ops: [insert, remove, lookup, scan, full_scan]
-        // let weights = [0.0, 0.0, 100.0, 0.0, 0.00];
-        let weights = [20.0, 20.0, 55.0, 5.0, 0.00];
+        let weights = [0.0, 0.0, 100.0, 0.0, 0.00];
+        // let weights = [20.0, 20.0, 55.0, 5.0, 0.00];
         // let weights = [00.0, 100.0, 0.0, 0.0, 0.00];
         // let weights = [50.0, 50.0,  0.0, 0.0, 0.00];
 
@@ -66,7 +66,10 @@ mod benchmark {
         let barrier = Arc::new(Barrier::new(n_threads + 1));
         let total_num_operations = Arc::new(AtomicUsize::new(0));
 
-        let treeindex: Arc<PersistentBPlusTree> = PersistentBPlusTree::new_registered();
+        let (dtid, treeindex) = PersistentBPlusTree::create().expect("ok");
+        // let dtid = 0;
+        // let treeindex = PersistentBPlusTree::load(dtid).expect("can load");
+        println!("dtid: {}", dtid);
 
         if !empty {
             let mut rng = thread_rng();
@@ -77,7 +80,7 @@ mod benchmark {
             start!(t_insert);
             for i in 0..ops_per_thread {
                 let mut iter = treeindex.raw_iter_mut();
-                if i % 1000 == 0 {
+                if false && i % 10000 == 0 {
                     iter.insert(data[i].to_be_bytes(), b"0".repeat(128 * 1024));
                 } else {
                     iter.insert(data[i].to_be_bytes(), data[i].to_be_bytes());
@@ -87,6 +90,7 @@ mod benchmark {
         }
 
         println!("Insertion done");
+        // return;
 
         let mut handles = vec![];
         for _ in 0..n_threads {
@@ -164,5 +168,8 @@ mod benchmark {
         let ops = total_num_operations.load(Relaxed);
         println!("{:?} {}", end_time.saturating_duration_since(start_time), total_num_operations.load(Relaxed));
         print_dbg_reports(ops);
+
+        // treeindex.evict().map_err(|_| ()).expect("can evict");
+        // crate::persistent::bufmgr().persist_metadata().expect("can persist");
     }
 }

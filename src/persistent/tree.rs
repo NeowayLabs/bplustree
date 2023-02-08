@@ -3,10 +3,12 @@ use crate::error::{self, NonOptimisticExt, BufMgrError};
 use crate::persistent::node::SplitStrategy;
 use crate::{dbg_tag, dbg_find_parent_ptr_cmp, dbg_merge_prepare, dbg_merge_left, dbg_merge_right};
 
-use super::node::{Node, NodeKind, LeafNode, InternalNode, SplitEntryHint, SplitMeta};
+use super::bufmgr::registry::DataStructureType;
+use super::bufmgr::RESERVED_EPOCH;
+use super::node::{Node, NodeKind, LeafNode, SplitEntryHint};
 use super::bufmgr::{
     registry::{ManagedDataStructure, ParentResult, DataStructureId},
-    swip::Swip, OptSwipGuard, ShrSwipGuard, ExvSwipGuard, BufferFrame,
+    swip::Swip, OptSwipGuard, BufferFrame,
     BfState
 };
 
@@ -41,6 +43,17 @@ pub struct PersistentBPlusTree {
     pub(crate) bufmgr: &'static BufferManager
 }
 
+use std::fmt;
+
+impl fmt::Debug for PersistentBPlusTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistentBPlusTree")
+            .field("root", &self.root)
+            .field("dtid", &self.dtid)
+            .finish()
+    }
+}
+
 pub(crate) enum ParentHandler<'t> {
     Root { tree_guard: OptimisticGuard<'t, Swip<HybridLatch<BufferFrame>>> },
     Parent {
@@ -55,15 +68,6 @@ pub(crate) enum Direction {
     Reverse
 }
 
-macro_rules! tp {
-    ($x:expr) => {
-        // println!("[{:?}] {}", std::thread::current().id(), format!($x));
-    };
-    ($x:expr, $($y:expr),+) => {
-        // println!("[{:?}] {}", std::thread::current().id(), format!($x, $($y),+));
-    };
-}
-
 pub type OptNodeGuard = OptimisticGuard<'static, Node, BufferFrame>;
 pub type ShrNodeGuard = SharedGuard<'static, Node, BufferFrame>;
 pub type ExvNodeGuard = ExclusiveGuard<'static, Node, BufferFrame>;
@@ -75,6 +79,9 @@ impl ManagedDataStructure for PersistentBPlusTree {
     }
     fn bf_to_page_value_mut(bf: &mut BufferFrame) -> &mut Self::PageValue {
         unsafe { &mut *(std::ptr::addr_of_mut!(bf.page.value) as *mut Node) }
+    }
+    fn root(&self) -> &'static HybridLatch<BufferFrame> {
+        self.root.optimistic_or_spin().as_ref()
     }
     fn find_parent(&self, needle: &impl HybridGuard<Self::PageValue, BufferFrame>) -> error::Result<ParentResult> {
         let parent_handler = self.find_parent_or_unwind(needle)?;
@@ -98,6 +105,21 @@ impl ManagedDataStructure for PersistentBPlusTree {
             }
         }
         Ok(())
+    }
+    fn iterate_children_swips_mut<'a>(&self, needle: &mut Self::PageValue, mut f: Box<dyn FnMut(&mut Swip<HybridLatch<BufferFrame>>) -> bool + 'a>) {
+        if !needle.is_leaf() {
+            for pos in 0..=needle.len() {
+                let swip = match needle.downcast_mut() {
+                    NodeKind::Leaf(_) => {
+                        unreachable!("not leaf");
+                    }
+                    NodeKind::Internal(node) => node.edge_at_mut(pos)
+                };
+                if !f(swip) {
+                    break
+                }
+            }
+        }
     }
     fn inspect(&self, tag: &str, value: &Self::PageValue) {
         let lower = to_u64(value.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0]));
@@ -188,11 +210,6 @@ enum TreeOrParent<'a> {
     Parent(OptNodeGuard, usize)
 }
 
-//  fn to_u64(slice: &[u8]) -> u64 {
-//      use std::convert::TryInto;
-//      u64::from_be_bytes(slice.try_into().unwrap()) // FIXME debug
-//  }
-
 fn reaching_leaves_debug(
     needle: &impl HybridGuard<Node, BufferFrame>,
     target_guard: &OptNodeGuard,
@@ -280,8 +297,6 @@ fn reaching_leaves_debug(
     crate::dbg_global_report!();
     crate::dbg_local_report!();
 
-    //                     println!("path {:?}", path);
-
     if let Some(tups) = parent_keys.as_ref() {
         let found = tups.iter().find(|(key, edge)| edge.as_hot_ptr() == needle.latch() as *const _ as u64);
         if let Some((key, edge)) = found {
@@ -293,75 +308,62 @@ fn reaching_leaves_debug(
         }
     }
 
-    println!("{:?} node keys", node_keys);
+    eprintln!("{:?} node keys", node_keys);
 
-    println!("leaf_len {}, node_len {}, node is_leaf {}", leaf_len, node_len, node_is_leaf);
+    eprintln!("leaf_len {}, node_len {}, node is_leaf {}", leaf_len, node_len, node_is_leaf);
 
-    // println!("leaf addr: {:?}, node addr: {:?}", std::ptr::addr_of!(leaf.base.data) as usize, std::ptr::addr_of!(node.data) as usize);
+    eprintln!("{:?} leaf lower_fence", leaf_lower_fence);
+    eprintln!("{:?} leaf upper_fence", leaf_upper_fence);
 
-    println!("{:?} leaf lower_fence", leaf_lower_fence);
-    println!("{:?} leaf upper_fence", leaf_upper_fence);
+    eprintln!("{:?} node lower_fence", node_lower_fence);
+    eprintln!("{:?} node upper_fence", node_upper_fence);
 
-    println!("{:?} node lower_fence", node_lower_fence);
-    println!("{:?} node upper_fence", node_upper_fence);
+    eprintln!("{:?} leaf pid", leaf_pid);
+    eprintln!("{:?} node pid", node_pid);
 
-    println!("{:?} leaf pid", leaf_pid);
-    println!("{:?} node pid", node_pid);
-
-    println!("{:?} leaf state", leaf_state);
-    println!("{:?} node state", node_state);
+    eprintln!("{:?} leaf state", leaf_state);
+    eprintln!("{:?} node state", node_state);
 
     if let Some(tups) = parent_keys {
-        println!("{:?} parent keys", tups.iter().map(|(k, e)| k).collect::<Vec<_>>());
+        eprintln!("{:?} parent keys", tups.iter().map(|(k, e)| k).collect::<Vec<_>>());
     }
-
-    // println!("reaching leaves, merges or splits are wrong");
-    // std::process::exit(3);
     Ok(())
 }
 
 impl PersistentBPlusTree {
-//      pub fn new() -> Self {
-//          let node_guard = allocate_leaf_for(9999, 1).expect("no frame to allocate root"); // FIXME this dtid is wrong
-//  
-//          PersistentBPlusTree {
-//              root: HybridLatch::new(Swip::from_ref(node_guard.latch())),
-//              height: AtomicUsize::new(1),
-//              dtid: 0 // FIXME this method should not exist
-//          }
-//      }
-
-    pub fn new_registered() -> Arc<PersistentBPlusTree> {
-        let bufmgr = bufmgr();
-        let dtid = bufmgr.registry().reserve_dtid();
-        let node_guard = allocate_leaf_for(bufmgr, dtid, 1).expect("no frame to allocate root");
-
-        let tree = Arc::new(PersistentBPlusTree {
-            root: HybridLatch::new(Swip::from_ref(node_guard.latch())),
-            height: AtomicUsize::new(1),
-            dtid,
-            bufmgr,
-        });
-
-        bufmgr.registry().register(dtid, tree.clone());
-
-        tree
+    pub fn load_with(bufmgr: &'static BufferManager, dtid: DataStructureId) -> Option<Arc<PersistentBPlusTree>> {
+        bufmgr.load_data_structure(dtid, DataStructureType::BTREE, |dtid, guard: ExclusiveGuard<Node, BufferFrame>| {
+            PersistentBPlusTree {
+                root: HybridLatch::new(Swip::from_ref(guard.latch())),
+                height: AtomicUsize::new(1),
+                dtid,
+                bufmgr,
+            }
+        })
     }
 
-    pub fn new_registered_with(bufmgr: &'static BufferManager) -> Arc<PersistentBPlusTree> {
-        let dtid = bufmgr.registry().reserve_dtid();
-        let node_guard = allocate_leaf_for(bufmgr, dtid, 1).expect("no frame to allocate root");
+    pub fn load(dtid: DataStructureId) -> Option<Arc<PersistentBPlusTree>> {
+        PersistentBPlusTree::load_with(bufmgr(), dtid)
+    }
 
-        let tree = Arc::new(PersistentBPlusTree {
-            root: HybridLatch::new(Swip::from_ref(node_guard.latch())),
-            height: AtomicUsize::new(1),
-            dtid,
-            bufmgr,
-        });
+    pub fn create_with(bufmgr: &'static BufferManager) -> Option<(DataStructureId, Arc<PersistentBPlusTree>)> {
+        bufmgr.create_data_structure(DataStructureType::BTREE, |dtid, mut guard: ExclusiveGuard<Node, BufferFrame>, capacity| {
+            guard.init(true, capacity);
+            PersistentBPlusTree {
+                root: HybridLatch::new(Swip::from_ref(guard.latch())),
+                height: AtomicUsize::new(1),
+                dtid,
+                bufmgr
+            }
+        })
+    }
 
-        bufmgr.registry().register(dtid, tree.clone());
+    pub fn create() -> Option<(DataStructureId, Arc<PersistentBPlusTree>)> {
+        PersistentBPlusTree::create_with(bufmgr())
+    }
 
-        tree
+    pub fn evict(self: Arc<Self>) -> Result<(), Arc<Self>> {
+        self.bufmgr.evict_data_structure(self.dtid, DataStructureType::BTREE, self)
     }
 
     pub fn root_hints(&self) -> Vec<u32> {
@@ -392,20 +394,14 @@ impl PersistentBPlusTree {
     pub(crate) fn lock_coupling(bufmgr: &'static BufferManager, swip_guard: OptSwipGuard<'static>) -> error::Result<(OptSwipGuard<'static>, OptNodeGuard)> {
         let (swip_guard, latch) = bufmgr.resolve_swip_fast(swip_guard, true)?;
         let bf_guard = latch.optimistic_or_spin();
-//          let got_free = bf_guard.state != BfState::Hot;
-//          let state = bf_guard.state;
+        debug_assert_ne!(BfState::Free, bf_guard.state);
         let node_guard = bf_to_node_guard(bf_guard);
         swip_guard.recheck()?;
-//          if got_free {
-//              panic!("got free bug {:?}", state);
-//          }
         Ok((swip_guard, node_guard))
     }
 
     pub(crate) fn lock_coupling_or_unwind(bufmgr: &'static BufferManager, swip_guard: OptSwipGuard<'static>) -> error::Result<(OptSwipGuard<'static>, OptNodeGuard)> {
-        tp!("before resolve");
         let (swip_guard, latch) = bufmgr.resolve_swip_fast(swip_guard, false)?;
-        tp!("after resolve");
         let bf_guard = latch.optimistic_or_unwind()?;
         debug_assert_ne!(BfState::Free, bf_guard.state);
         let node_guard = bf_to_node_guard(bf_guard);
@@ -428,9 +424,6 @@ impl PersistentBPlusTree {
             bf_to_node_guard(root_latch.optimistic_or_spin())
         } else {
             let res = root_latch.optimistic_or_unwind();
-//              if res.is_err() {
-//                  tp!("LATCHED: {}", root_latch.is_exclusively_latched());
-//              }
             bf_to_node_guard(res?)
         };
         dbg_tag!(3);
@@ -452,33 +445,22 @@ impl PersistentBPlusTree {
         };
         dbg_tag!(5);
 
-//          let mut t_guard = Some(tree_guard);
-//          let mut p_guard: Option<OptNodeGuard> = None;
-//          let mut target_guard = root_guard;
-
-
         let mut p_guard = TreeOrParent::Tree(tree_guard);
         let mut target_guard = root_guard;
 
-        // let mut path = vec!();
-        // use std::convert::TryInto;
         loop {
             let (swip_guard, pos) = match target_guard.downcast() {
                 NodeKind::Internal(ref internal) => {
                     match param {
                         SearchParam::Key(key) => {
                             let (pos, _) = internal.lower_bound(key)?;
-                            // path.push((u64::from_be_bytes(key.try_into().unwrap()), pos));
                             dbg_find_parent_step_inner!(target_guard, pos, key);
                             let swip_guard = OptimisticGuard::map(target_guard, |node| node.try_internal()?.edge_at(pos))?;
-                            // let swip = internal.edge_at(pos)?;
 
                             (swip_guard, pos)
                         }
                         SearchParam::Infinity => {
                             let pos = internal.base.len();
-                            // path.push((987987987987987, pos));
-                            // let swip = internal.upper_edge()?;
                             let swip_guard = OptimisticGuard::map(target_guard, |node| node.try_internal()?.upper_edge())?;
                             (swip_guard, pos)
                         }
@@ -500,7 +482,6 @@ impl PersistentBPlusTree {
                     reaching_leaves_debug(needle, &target_guard, leaf, p_guard)?;
 
                     panic!("reaching leaves, merges or splits are wrong");
-                    // return Err(error::Error::Unwind);
                 }
             };
 
@@ -525,29 +506,13 @@ impl PersistentBPlusTree {
                 PersistentBPlusTree::lock_coupling_or_unwind(self.bufmgr, swip_guard)?
             };
 
-//              // TODO unneeded comparison
-//              dbg_find_parent_ptr_cmp!(swip_guard, needle);
-//  
-//              if swip_guard.as_hot_ptr() == needle.latch() as *const _ as u64 {
-//                  swip_guard.recheck()?;
-//                  return Ok(ParentHandler::Parent {
-//                      parent_guard: swip_to_node_guard(swip_guard),
-//                      pos
-//                  });
-//              }
-
             if let TreeOrParent::Tree(ref guard) = p_guard {
                 guard.recheck()?;
             }
 
             p_guard = TreeOrParent::Parent(swip_to_node_guard(swip_guard), pos);
 
-//              p_guard = Some(swip_to_node_guard(swip_guard));
             target_guard = node_guard;
-
-//              if let Some(tree_guard) = t_guard.take() {
-//                  tree_guard.recheck()?;
-//              }
         }
     }
 
@@ -563,10 +528,8 @@ impl PersistentBPlusTree {
         let key = key.as_ref();
         let tree_guard = self.root.optimistic_or_spin();
         let root_latch = tree_guard.as_ref();
-        // let root_latch_ptr = root_latch as *const _;
         let root_guard = bf_to_node_guard(root_latch.optimistic_or_spin());
-        // let root_guard2 = bf_to_node_guard(root_latch.optimistic_or_spin());
-        
+
         let mut p_guard = TreeOrParent::Tree(tree_guard);
         let mut target_guard = root_guard;
 
@@ -578,13 +541,11 @@ impl PersistentBPlusTree {
             let (swip_guard, pos) = match target_guard.downcast() {
                 NodeKind::Internal(internal) => {
                     let (pos, _) = internal.lower_bound(key)?;
-                    // tp!("found leaf and parent {} {} {}", level, pos, internal.base.len());
                     dbg_find_parent_step_inner!(target_guard, pos, key);
                     let swip_guard = OptimisticGuard::map(target_guard, |node| node.try_internal()?.edge_at(pos))?;
                     (swip_guard, pos)
                 }
                 NodeKind::Leaf(_leaf) => {
-                    // tp!("found leaf");
                     dbg_find_parent_step_leaf!(target_guard, key);
                     break target_guard;
                 }
@@ -593,7 +554,6 @@ impl PersistentBPlusTree {
             // TODO if level == height - 1 use shared mode
 
             let (swip_guard, node_guard) = PersistentBPlusTree::lock_coupling(self.bufmgr, swip_guard)?;
-            // tp!("swizzled {}", pos);
             if let TreeOrParent::Tree(ref guard) = p_guard {
                 guard.recheck()?;
             }
@@ -616,10 +576,6 @@ impl PersistentBPlusTree {
         };
 
         leaf_guard.recheck()?;
-
-//          if level == 10 {
-//              root_guard2.recheck()?;
-//          }
 
         Ok((leaf_guard, p_res))
     }
@@ -788,8 +744,6 @@ impl PersistentBPlusTree {
                         }
                         Err(_) => {
                             break; // TODO not ensuring merges happen timely
-                            // guard = guard.latch().optimistic_or_spin();
-                            // continue
                         }
                     }
                 }
@@ -797,13 +751,14 @@ impl PersistentBPlusTree {
         }
     }
 
+    // Care must be taken when allocating a node in this function, any nodes allocated and not used
+    // must be reclaimed. Take extra care with unwind points after allocating.
     pub(crate) fn try_split(&self, needle: &OptNodeGuard, entry_hint: Option<SplitEntryHint>) -> error::Result<()> {
-        // tp!("trysplit");
         let parent_handler = self.find_parent(needle)?;
 
         match parent_handler {
             ParentHandler::Root { tree_guard } => {
-                let mut tree_guard_x = tree_guard.to_exclusive()?; // TODO tree root should not need this lock (use atomic store)
+                let mut tree_guard_x = tree_guard.to_exclusive()?;
 
                 let root_latch = tree_guard_x.as_ref();
 
@@ -814,16 +769,22 @@ impl PersistentBPlusTree {
                 match root_guard_x.downcast_mut() {
                     NodeKind::Internal(root_internal_node) => {
                         if root_internal_node.base.len() <= 2 {
-                            panic!("this will leak a frame");
                             return Ok(())
                         }
-                
-                        let mut new_root_guard_x = self.allocate_internal_for(1)?; // TODO set some marker so it does not get evicted
+
+                        let mut new_root_guard_x = self.allocate_internal_for(1)?;
+                        new_root_guard_x.as_unmapped_mut().epoch.store(RESERVED_EPOCH , Ordering::Release); // This epoch prevents eviction
 
                         let split_pos = root_internal_node.base.len() / 2; // TODO choose a better split position if bulk loading
                         let split_key = root_internal_node.full_key_at(split_pos).expect("should exist");
 
-                        let mut new_right_node_guard_x = self.allocate_internal_for(1)?; // Think about different size classes
+                        let mut new_right_node_guard_x = match self.allocate_internal_for(1) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                self.bufmgr.reclaim_page(ExclusiveGuard::unmap(new_root_guard_x));
+                                return Err(error::Error::Unwind);
+                            }
+                        };
 
                         {
                             let new_right_node = new_right_node_guard_x.as_internal_mut();
@@ -844,31 +805,41 @@ impl PersistentBPlusTree {
                         self.height.fetch_add(1, Ordering::Relaxed);
                     }
                     NodeKind::Leaf(root_leaf_node) => {
-//                          if root_leaf_node.base.len() <= 2 {
-//                              println!("test"); // FIXME dropping allocated internal here (check
-//                                                // other places)
-//                              return Ok(())
-//                          }
                         dbg_split_prepare!(_split, root_leaf_node);
 
+                        // TODO choose a better split position if bulk loading
                         let split_strategy = root_leaf_node.split_heuristic(entry_hint).unopt();
 
                         match &split_strategy {
                             SplitStrategy::SplitAt { key, split_pos, new_left_size, right_size } => {
-                                let mut new_root_guard_x = self.allocate_internal_for(1)?; // TODO set some marker so it does not get evicted
+                                let mut new_root_guard_x = self.allocate_internal_for(1)?;
+                                new_root_guard_x.as_unmapped_mut().epoch.store(RESERVED_EPOCH , Ordering::Release); // This epoch prevents eviction
 
-                                // let split_pos = root_leaf_node.base.len() / 2; // TODO choose a better split position if bulk loading
-
-                                let mut new_right_node_guard_x = self.allocate_leaf_for(*right_size)?; // Think about different size classes
+                                let mut new_right_node_guard_x = match self.allocate_leaf_for(*right_size) {
+                                    Ok(f) => f,
+                                    Err(_) => {
+                                        self.bufmgr.reclaim_page(ExclusiveGuard::unmap(new_root_guard_x));
+                                        return Err(error::Error::Unwind);
+                                    }
+                                };
 
                                 let mut new_left = match new_left_size {
-                                    Some(left_size) => Some(self.allocate_leaf_for(*left_size)?),
+                                    Some(left_size) => {
+                                        match self.allocate_leaf_for(*left_size) {
+                                            Ok(f) => Some(f),
+                                            Err(_) => {
+                                                self.bufmgr.reclaim_page(ExclusiveGuard::unmap(new_root_guard_x));
+                                                self.bufmgr.reclaim_page(ExclusiveGuard::unmap(new_right_node_guard_x));
+                                                return Err(error::Error::Unwind);
+                                            }
+                                        }
+                                    },
                                     None => None
                                 };
 
                                 {
                                     let new_right_node = new_right_node_guard_x.as_leaf_mut();
-                                    root_leaf_node.split_large(
+                                    root_leaf_node.split(
                                         new_right_node,
                                         new_left
                                             .as_deref_mut()
@@ -898,8 +869,6 @@ impl PersistentBPlusTree {
                                     self.height.fetch_add(1, Ordering::Relaxed);
 
                                     self.bufmgr
-
-
                                         .reclaim_page(ExclusiveGuard::unmap(root_guard_x));
 
                                 } else {
@@ -918,7 +887,7 @@ impl PersistentBPlusTree {
 
                             }
                             SplitStrategy::Grow { new_size } => {
-                                // TODO dbg_grow: dbg_split!(_split, new_left_leaf, new_right_node_guard_x.as_leaf_mut(), parent_internal.base.len(), pos, &split_key);
+                                // TODO dbg_grow!(...)
 
                                 let mut new_root_guard_x = self.allocate_leaf_for(*new_size)?;
 
@@ -936,7 +905,6 @@ impl PersistentBPlusTree {
                 }
             },
             ParentHandler::Parent { parent_guard, pos } => {
-                // tp!("parent");
                 let swip_guard = OptimisticGuard::map(parent_guard, |node| node.try_internal()?.edge_at(pos))?;
                 let (swip_guard, target_guard) = PersistentBPlusTree::lock_coupling(self.bufmgr, swip_guard)?;
                 let parent_guard = swip_to_node_guard(swip_guard);
@@ -946,7 +914,7 @@ impl PersistentBPlusTree {
                 let mut parent_guard_x = parent_guard.to_exclusive_bf()?;
                 let mut target_guard_x = target_guard.to_exclusive_bf()?;
 
-                // let split_pos = target_guard.len() / 2; // TODO choose a better split position if bulk loading
+                // TODO choose a better split position if bulk loading
                 let split_strategy = match target_guard_x.downcast() {
                     NodeKind::Leaf(leaf) => {
                         leaf.split_heuristic(entry_hint)?
@@ -967,7 +935,6 @@ impl PersistentBPlusTree {
                     match target_guard_x.downcast_mut() {
                         NodeKind::Internal(left_internal) => {
                             if left_internal.base.len() <= 2 {
-                                panic!("this will leak a frame");
                                 return Ok(())
                             }
 
@@ -1000,17 +967,6 @@ impl PersistentBPlusTree {
                             }
                         }
                         NodeKind::Leaf(left_leaf) => {
-//                              if left_leaf.base.len() <= 2 {
-//                                  return Ok(())
-//                              }
-
-//                             let lower = to_u64(left_leaf.base.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0])); // FIXME debug
-//                             let upper = to_u64(left_leaf.base.upper_fence().unopt().unwrap_or(&[255, 255, 255, 255, 255, 255, 255, 255])); // FIXME debug
-//                             let split = to_u64(split_key.as_slice());
-//                             if split <= lower || split > upper {
-//                                 panic!("Bad node found");
-//                             }
-
                             dbg_split_prepare!(_split, left_leaf);
 
                             match &split_strategy {
@@ -1018,13 +974,21 @@ impl PersistentBPlusTree {
                                     let mut new_right_node_guard_x = self.allocate_leaf_for(*right_size)?;
 
                                     let mut new_left = match new_left_size {
-                                        Some(left_size) => Some(self.allocate_leaf_for(*left_size)?),
+                                        Some(left_size) => {
+                                            match self.allocate_leaf_for(*left_size) {
+                                                Ok(f) => Some(f),
+                                                Err(_) => {
+                                                    self.bufmgr.reclaim_page(ExclusiveGuard::unmap(new_right_node_guard_x));
+                                                    return Err(error::Error::Unwind);
+                                                }
+                                            }
+                                        },
                                         None => None
                                     };
 
                                     {
                                         let new_right_node = new_right_node_guard_x.as_leaf_mut();
-                                        left_leaf.split_large(
+                                        left_leaf.split(
                                             new_right_node,
                                             new_left
                                                 .as_deref_mut()
@@ -1046,14 +1010,11 @@ impl PersistentBPlusTree {
                                         dbg_split!(_split, _new_left_leaf, new_right_node_guard_x.as_leaf_mut(), parent_internal.base.len(), pos, &split_key);
                                         if pos == parent_internal.base.len() {
                                             let _old_left_edge = parent_internal.replace_upper_edge(new_right_node_edge);
-//                                             println!("SPLIT upper, {} ({} - {})", split, lower, upper);
                                             parent_internal.insert(split_key, new_left_edge);
 
                                             self.bufmgr.reclaim_page(ExclusiveGuard::unmap(target_guard_x));
                                         } else {
                                             let _old_left_edge = parent_internal.replace_edge_at(pos, new_right_node_edge);
-//                                             println!("SPLIT {}, {} ({} - {})", pos, split, lower, upper);
-//                                             assert!(left_edge.as_raw() == target_guard_x.latch() as *const _ as u64);
                                             parent_internal.insert(split_key, new_left_edge);
                                             self.bufmgr.reclaim_page(ExclusiveGuard::unmap(target_guard_x));
                                         }
@@ -1062,12 +1023,9 @@ impl PersistentBPlusTree {
                                         dbg_split!(_split, left_leaf, new_right_node_guard_x.as_leaf_mut(), parent_internal.base.len(), pos, &split_key);
                                         if pos == parent_internal.base.len() {
                                             let left_edge = parent_internal.replace_upper_edge(new_right_node_edge);
-//                                             println!("SPLIT upper, {} ({} - {})", split, lower, upper);
                                             parent_internal.insert(split_key, left_edge);
                                         } else {
                                             let left_edge = parent_internal.replace_edge_at(pos, new_right_node_edge);
-//                                             println!("SPLIT {}, {} ({} - {})", pos, split, lower, upper);
-//                                             assert!(left_edge.as_raw() == target_guard_x.latch() as *const _ as u64);
                                             parent_internal.insert(split_key, left_edge);
                                         }
                                     }
@@ -1081,7 +1039,7 @@ impl PersistentBPlusTree {
 
                                     let parent_internal = parent_guard_x.as_internal_mut();
 
-                                    // TODO dbg_grow: dbg_split!(_split, new_left_leaf, new_right_node_guard_x.as_leaf_mut(), parent_internal.base.len(), pos, &split_key);
+                                    // TODO dbg_grow!(...)
                                     if pos == parent_internal.base.len() {
                                         let _old_left_edge = parent_internal.replace_upper_edge(new_leaf_node_edge);
                                         self.bufmgr.reclaim_page(ExclusiveGuard::unmap(target_guard_x));
@@ -1094,15 +1052,12 @@ impl PersistentBPlusTree {
                         }
                     }
                 } else {
-                    // parent_guard.recheck()?;
                     let parent_guard = parent_guard_x.unlock();
                     target_guard_x.unlock();
                     self.try_split(&parent_guard, None)?;
                 }
             }
         }
-        // tp!("done");
-
         Ok(())
     }
 
@@ -1120,7 +1075,7 @@ impl PersistentBPlusTree {
                 let (swip_guard, mut target_guard) = PersistentBPlusTree::lock_coupling(self.bufmgr, swip_guard)?;
                 let mut parent_guard = swip_to_node_guard(swip_guard);
 
-                if !target_guard.is_underfull() { // TODO is_underfull
+                if !target_guard.is_underfull() {
                     target_guard.recheck()?;
                     return Ok(false);
                 }
@@ -1145,22 +1100,6 @@ impl PersistentBPlusTree {
                         match target_guard_x.downcast_mut() {
                             NodeKind::Leaf(ref mut target_leaf) => {
                                 assert!(left_guard_x.is_leaf());
-//                                 let parent_internal = parent_guard_x.as_internal();
-//                                 let pos_key = to_u64(parent_internal.full_key_at(pos).unopt().as_slice());
-//                                 let prev_key = to_u64(parent_internal.full_key_at(pos - 1).unopt().as_slice());
-//                                 let pos_upper = to_u64(target_leaf.base.upper_fence().unopt().unwrap_or(&[255, 255, 255, 255, 255, 255, 255, 255]));
-//                                 let prev_upper = to_u64(left_guard_x.upper_fence().unopt().unwrap_or(&[255, 255, 255, 255, 255, 255, 255, 255]));
-//                                 let pos_lower = to_u64(target_leaf.base.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0]));
-//                                 let prev_lower = to_u64(left_guard_x.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0]));
-//
-//                                 if pos_key != pos_upper || prev_key != prev_upper {
-//                                     println!("merge left bug at {}, {}", pos - 1, pos);
-//                                     println!("pos_key = {}, pos_upper = {}", pos_key, pos_upper);
-//                                     println!("prev_key = {}, prev_upper = {}", prev_key, prev_upper);
-//                                     println!("pos: {} - {}", pos_lower, pos_upper);
-//                                     println!("prev: {} - {}", prev_lower, prev_upper);
-//                                     std::process::exit(3);
-//                                 }
 
                                 dbg_merge_prepare!(_merge, left_guard_x.as_leaf_mut(), target_leaf, r_latch);
 
@@ -1174,22 +1113,13 @@ impl PersistentBPlusTree {
                                     let parent_internal = parent_guard_x.as_internal_mut();
                                     if pos == parent_len {
                                         let left_edge = parent_internal.remove_edge_at(pos - 1);
-//                                         println!("MERGE LEFT {} upper", pos - 1);
                                         let _dropped_edge = parent_internal.replace_upper_edge(left_edge);
                                         assert_eq!(_dropped_edge.as_hot_ptr(), target_guard_x.latch() as *const _ as u64);
                                     } else {
-//                                         println!(
-//                                             "MERGE LEFT  ({}, {}), ({}, {})",
-//                                             pos - 1, to_u64(parent_internal.full_key_at(pos - 1).unopt().as_slice()),
-//                                             pos, to_u64(parent_internal.full_key_at(pos).unopt().as_slice())
-//                                         );
                                         let left_edge = parent_internal.remove_edge_at(pos - 1);
                                         let _dropped_edge = parent_internal.replace_edge_at(pos - 1, left_edge);
                                         assert_eq!(_dropped_edge.as_hot_ptr(), target_guard_x.latch() as *const _ as u64);
                                     }
-
-//                                     assert_eq!(prev_lower, to_u64(left_guard_x.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0])));
-//                                     assert_eq!(pos_upper, to_u64(left_guard_x.upper_fence().unopt().unwrap()));
 
                                     // reclaim
                                     self.bufmgr.reclaim_page(ExclusiveGuard::unmap(target_guard_x));
@@ -1260,26 +1190,6 @@ impl PersistentBPlusTree {
                         match target_guard_x.downcast_mut() {
                             NodeKind::Leaf(ref mut target_leaf) => {
                                 assert!(right_guard_x.is_leaf());
-//                                 let parent_internal = parent_guard_x.as_internal();
-//                                 let pos_key = to_u64(parent_internal.full_key_at(pos).unopt().as_slice());
-//                                 let next_key = if pos + 1 == parent_len {
-//                                     std::u64::MAX
-//                                 } else {
-//                                     to_u64(parent_internal.full_key_at(pos + 1).unopt().as_slice())
-//                                 };
-//                                 let target_upper = to_u64(target_leaf.base.upper_fence().unopt().unwrap());
-//                                 let next_upper = to_u64(right_guard_x.upper_fence().unopt().unwrap_or(&[255, 255, 255, 255, 255, 255, 255, 255]));
-//                                 let target_lower = to_u64(target_leaf.base.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0]));
-//                                 let next_lower = to_u64(right_guard_x.lower_fence().unopt().unwrap());
-//
-//                                 if pos_key != target_upper || next_key != next_upper {
-//                                     println!("merge right bug at {}, {}", pos, pos + 1);
-//                                     println!("pos_key = {}, pos_upper = {}", pos_key, target_upper);
-//                                     println!("next_key = {}, next_upper = {}", next_key, next_upper);
-//                                     println!("pos: {} - {}", target_lower, target_upper);
-//                                     println!("next: {} - {}", next_lower, next_upper);
-//                                     std::process::exit(3);
-//                                 }
 
                                 dbg_merge_prepare!(_merge, target_leaf, right_guard_x.as_leaf_mut(), r_latch);
 
@@ -1293,21 +1203,12 @@ impl PersistentBPlusTree {
                                     let parent_internal = parent_guard_x.as_internal_mut();
                                     if pos + 1 == parent_len {
                                         let left_edge = parent_internal.remove_edge_at(pos);
-//                                         println!("MERGE RIGHT {} upper", pos);
                                         let _dropped_edge = parent_internal.replace_upper_edge(left_edge);
                                     } else {
 
-//                                         println!(
-//                                             "MERGE RIGHT ({}, {}), ({}, {})",
-//                                             pos, to_u64(parent_internal.full_key_at(pos).unopt().as_slice()),
-//                                             pos + 1, to_u64(parent_internal.full_key_at(pos + 1).unopt().as_slice())
-//                                         );
                                         let left_edge = parent_internal.remove_edge_at(pos);
                                         let _dropped_edge = parent_internal.replace_edge_at(pos, left_edge);
                                     }
-
-//                                     assert_eq!(target_lower, to_u64(target_leaf.base.lower_fence().unopt().unwrap_or(&[0, 0, 0, 0, 0, 0, 0, 0])));
-//                                     assert_eq!(next_key, to_u64(target_leaf.base.upper_fence().unopt().unwrap_or(&[255, 255, 255, 255, 255, 255, 255, 255])));
 
                                     // reclaim
                                     self.bufmgr.reclaim_page(ExclusiveGuard::unmap(right_guard_x));
@@ -1379,14 +1280,15 @@ impl PersistentBPlusTree {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryInto;
+
     use super::PersistentBPlusTree;
-    use crate::{persistent::ensure_global_bufmgr, latch::HybridGuard};
-    use serial_test::serial;
+    use crate::{persistent::{ensure_global_bufmgr, bufmgr}, latch::HybridGuard};
 
     #[test]
     fn persistent_bplustree_init() {
         ensure_global_bufmgr("/tmp/state.db", 1 * 1024 * 1024).unwrap();
-        let tree = PersistentBPlusTree::new_registered();
+        let (_, tree) = PersistentBPlusTree::create().expect("ok");
 
         let leaf = tree.find_leaf("test").unwrap();
         let addr = std::ptr::addr_of!(*leaf.as_unmapped().page) as u64;
@@ -1395,5 +1297,42 @@ mod tests {
         println!("node addr = {}, align 4096 = {}, 128 = {}", addr, addr % 4096, addr % 128);
         let addr = std::ptr::addr_of!(leaf.data) as u64;
         println!("data addr = {}, align 4096 = {}, 128 = {}", addr, addr % 4096, addr % 128);
+    }
+
+    #[test]
+    fn persistent_bplustree_evict_and_load() {
+        use rand::prelude::*;
+
+        std::fs::remove_file("/tmp/evict.db").expect("failed to clear db");
+        ensure_global_bufmgr("/tmp/evict.db", 100 * 1024 * 1024).unwrap();
+        let (dtid, tree) = PersistentBPlusTree::create().expect("ok");
+
+        let n = 1_000_000;
+        let mut rng = rand::thread_rng();
+        let mut data: Vec<usize> = (0..n).collect();
+        data.shuffle(&mut rng);
+
+        for i in 0..n {
+            let mut iter = tree.raw_iter_mut();
+            iter.insert(data[i].to_be_bytes(), data[i].to_be_bytes());
+        }
+
+        tree.evict().expect("evicted");
+
+        let tree = PersistentBPlusTree::load(dtid).expect("ok");
+
+        data.sort();
+
+        let mut iter = tree.raw_iter();
+        iter.seek_to_first();
+
+        for datum in data {
+            let v: usize = usize::from_be_bytes(iter.next().expect("early eof").1.try_into().expect("corrupted"));
+            assert_eq!(datum, v);
+        }
+
+        assert!(iter.next().is_none());
+
+        bufmgr().persist_metadata().expect("should persist");
     }
 }

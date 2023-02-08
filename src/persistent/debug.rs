@@ -5,8 +5,6 @@ use crossbeam_queue::SegQueue;
 
 use crate::persistent::bufmgr::registry::FrameDebugInfo;
 
-// TODO TODO TODO add loads and evictions to OPS
-
 pub(crate) static OPS: SegQueue<Op> = SegQueue::new();
 
 thread_local!(pub(crate) static LOCAL_OPS: RefCell<SmallVec<[LocalOp; 2048]>> = RefCell::new(SmallVec::new()));
@@ -22,7 +20,7 @@ pub(crate) fn to_u64(slice: &[u8]) -> u64 {
     if array.is_err() {
         println!("BUG got slice with len: {}, content: {:?}", slice.len(), slice);
     }
-    u64::from_be_bytes(array.unwrap()) // FIXME debug
+    u64::from_be_bytes(array.unwrap())
 }
 
 #[derive(Debug)]

@@ -1,5 +1,5 @@
 use crossbeam_queue::ArrayQueue;
-use io_uring::{opcode, types, IoUring};
+use io_uring::IoUring;
 use std::{os::unix::io::{AsRawFd, RawFd}, convert::TryInto};
 
 use crate::latch::{SharedGuard, HybridLatch};
@@ -143,18 +143,6 @@ impl Slot {
     }
 }
 
-//  struct Slot {
-//      alignment_offset: usize,
-//      storage: Box<[u8]>,
-//      size: usize,
-//      frame: Option<&'static HybridLatch<BufferFrame>>,
-//  }
-
-// TODO TODO TODO initialize or receive a reference to a ring and submit slots, (using slot index as
-// user data?) and wait for completion events mapping back to the frame reference
-//
-// FIXME maybe the buffer must wrap around, check reference impl
-
 fn aligned_boxed_slice(size: usize, alignment: usize) -> (usize, Box<[u8]>) {
     let storage_size = size + alignment;
     let storage = vec![0u8; storage_size].into_boxed_slice();
@@ -199,12 +187,6 @@ impl WriteBuffer {
                 state: State::Free
             });
         }
-        // TODO Proposed Plan
-        // - use size in bytes for buffer
-        // - allocate buffer with mmap to ensure alignment, or maybe Box<[u8]> and align manually
-        // - have a has_space_for fn
-        // - on add copy data to current offset and store offset, size and bf guard on metadata
-        // - submit events and match results to metadata
         WriteBuffer {
             n_slots,
             slot_size,
@@ -214,10 +196,6 @@ impl WriteBuffer {
             fd: fd.as_raw_fd(),
         }
     }
-
-//      pub(crate) fn has_space_for(&self, size: usize) -> bool {
-//          (self.offset + size) <= self.size
-//      }
 
     pub(crate) fn is_full(&self) -> bool {
         self.free_slots.is_empty()
@@ -246,14 +224,16 @@ impl WriteBuffer {
         unsafe { self.ring.submission().push(&entry).expect("must not be full") };
     }
 
-    pub(crate) fn submit(&mut self) {
+    pub(crate) fn submit(&mut self) -> usize {
         let ready_slots: Vec<_> = self.slots.iter_mut().filter(|s| s.state == State::Ready).collect();
-        if ready_slots.len() > 0 {
+        let ready_len = ready_slots.len();
+        if ready_len > 0 {
             self.ring.submit().expect("failed to submit");
             for slot in ready_slots {
                 slot.to_pending();
             }
         }
+        ready_len
     }
 
     pub(crate) fn poll_events_sync(&mut self) -> usize {
@@ -263,7 +243,6 @@ impl WriteBuffer {
             let slot_idx = entry.user_data() as usize;
 
             let slot = &mut self.slots[slot_idx];
-            // println!("result = {}", result);
             assert_eq!(slot.slot_bytes().len() as i32, result);
             assert_eq!(State::Pending, slot.state);
 
@@ -303,9 +282,9 @@ impl WriteBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::{fs::File, sync::atomic::{AtomicBool, AtomicUsize}};
 
-    use crate::latch::HybridLatch;
+    use crate::{latch::HybridLatch, persistent::bufmgr::EMPTY_EPOCH};
     use nix::sys::mman::{ProtFlags, MapFlags, MmapAdvise};
 
     use crate::persistent::bufmgr::{BufferFrame, Page, BfState, swip::Pid};
@@ -350,6 +329,8 @@ mod tests {
                 pid: Pid::new(page_id as u64, class as u8),
                 last_written_gsn: 0,
                 writting: false,
+                persisting: AtomicBool::new(false),
+                epoch: AtomicUsize::new(EMPTY_EPOCH),
                 page: page_ref
             });
 

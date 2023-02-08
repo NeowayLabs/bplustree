@@ -28,7 +28,7 @@ fn lookup(c: &mut Criterion) {
 
     type MapKV = [u8; 8];
 
-    let treeindex: Arc<PersistentBPlusTree> = PersistentBPlusTree::new_registered();
+    let (_, treeindex) = PersistentBPlusTree::create().expect("ok");
     let treeindex_inmem: Arc<GenericBPlusTree<MapKV, MapKV, 1536, 1536>> = Arc::new(GenericBPlusTree::new());
     let mut btreemap: BTreeMap<MapKV, MapKV> = BTreeMap::new();
 
@@ -109,7 +109,7 @@ fn end_to_end(c: &mut Criterion) {
             let mut data: Vec<usize> = (0..n_ops).collect();
             data.shuffle(&mut rng);
 
-            let treeindex: Arc<PersistentBPlusTree> = PersistentBPlusTree::new_registered_with(bufmgr);
+            let (_, treeindex) = PersistentBPlusTree::create_with(bufmgr).expect("ok");
 
             let start = Instant::now();
             for i in 0..iters {

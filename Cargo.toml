@@ -40,6 +40,7 @@ once_cell = "1.8"
 indexmap = "1.7"
 io-uring = "0.5.12"
 libc = "0.2.98"
+core_affinity = "0.8.0"
 rand = { version = "0.8", features = ["small_rng"] }
 criterion = "0.4.0"
 

@@ -1,6 +1,6 @@
 use crate::persistent::node::SplitEntryHint;
-use crate::persistent::tree::{PersistentBPlusTree, OptNodeGuard, ShrNodeGuard, ExvNodeGuard, Direction, swip_to_node_guard, bf_to_node_guard};
-use crate::latch::{OptimisticGuard, SharedGuard, ExclusiveGuard};
+use crate::persistent::tree::{PersistentBPlusTree, OptNodeGuard, ShrNodeGuard, ExvNodeGuard, Direction, swip_to_node_guard};
+use crate::latch::OptimisticGuard;
 use crate::error::{self, NonOptimisticExt};
 use crate::persistent::bufmgr::latch_ext::BfOptimisticGuardExt;
 
@@ -600,12 +600,6 @@ impl <'t> RawExclusiveIter<'t> {
                 let (guard, cursor) = self.leaf.as_mut().unwrap();
                 let leaf = guard.as_leaf_mut();
                 *cursor = new_cursor;
-                // println!("node: {:?}", leaf.base);
-                // println!("lower_fence: {:?}", leaf.base.lower_fence().unwrap());
-                // println!("upper_fence: {:?}", leaf.base.upper_fence().unwrap());
-                // println!("curr_pos: {}", curr_pos);
-                // println!("key: {:?}", leaf.key_at(curr_pos).unwrap());
-                // println!("fullkey: {:?}", leaf.full_key_at(curr_pos).unwrap());
                 leaf.copy_full_key_at(curr_pos, &mut self.buffer).unopt();
                 let value = leaf.value_at_mut(curr_pos);
                 return Some((&self.buffer[..], value));
@@ -694,12 +688,6 @@ impl <'t> RawExclusiveIter<'t> {
                     leaf.remove_at(pos);
                     continue 'start;
                 }
-                // println!("{:?}", leaf.base);
-                // println!("{:?} {:?}", key, leaf.full_key_at(pos).unopt().as_slice());
-                // todo!("replace");
-                // let (_k, v) = self.next().unwrap();
-                // let old = std::mem::replace(v, value);
-                // break Some(old);
             } else {
                 let (guard, cursor) = self.leaf.as_mut().expect("just seeked");
                 if guard.as_leaf().can_insert(key.len(), value.len()) {
@@ -744,12 +732,9 @@ impl <'t> RawExclusiveIter<'t> {
                         match perform_split() {
                             Ok(_) => break,
                             Err(error::Error::Reclaimed) => {
-                                unreachable!("can happen?");
-                                continue 'start;
+                                unreachable!("cannot happen");
                             }
                             Err(_) => {
-                                // FIXME test this
-                                // guard = bf_to_node_guard(guard.latch().optimistic_or_spin());
                                 continue 'start;
                             }
                         }
@@ -817,12 +802,10 @@ impl <'t> RawExclusiveIter<'t> {
                                 },
                                 Err(error::Error::Reclaimed) => {
                                     unreachable!("can happen?");
-                                    break;
+                                    // break;
                                 }
                                 Err(_) => {
                                     break; // TODO not ensuring merges
-                                    // guard = guard.latch().optimistic_or_spin();
-                                    // continue
                                 }
                             }
                         }
@@ -842,13 +825,13 @@ impl <'t> RawExclusiveIter<'t> {
 
 #[cfg(test)]
 mod tests {
-    use crate::persistent::tree::{PersistentBPlusTree};
+    use crate::persistent::tree::PersistentBPlusTree;
     use crate::persistent::ensure_global_bufmgr;
 
-    use super::{RawExclusiveIter};
+    use super::RawExclusiveIter;
     use serial_test::serial;
 
-    macro_rules! kv {
+    macro_rules! _kv {
         ($n:expr) => {
             Some((&$n[..], &$n[..]))
         };
@@ -864,7 +847,7 @@ mod tests {
     #[serial]
     fn persistent_iter_test() {
         ensure_global_bufmgr("/tmp/state.db", 1 * 1024 * 1024).unwrap();
-        let tree = PersistentBPlusTree::new_registered();
+        let (_, tree) = PersistentBPlusTree::create().expect("ok");
         let mut iter = RawExclusiveIter::new(&tree);
         iter.insert([1], [1]);
         iter.seek_to_first();
@@ -876,7 +859,6 @@ mod tests {
         assert_eq!(iter.next(), None);
     }
 
-    // FIXME !!!!!!!!!!!! writing past capacity
     #[test]
     #[serial]
     fn persistent_sanity_check() {
@@ -885,7 +867,7 @@ mod tests {
 
         ensure_global_bufmgr("/tmp/state.db", 100 * 1024 * 1024).unwrap();
 
-        let bptree = PersistentBPlusTree::new_registered();
+        let (_, bptree) = PersistentBPlusTree::create().expect("ok");
 
         let mut iter = RawExclusiveIter::new(&bptree);
 
@@ -912,7 +894,6 @@ mod tests {
         let t0 = std::time::Instant::now();
         for i in 0..n {
             iter.insert(strings[i].as_slice(), data[i].to_be_bytes());
-            // println!("n: {}", i);
         }
         println!("insert took: {:?}", t0.elapsed());
 
@@ -923,21 +904,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         for i in 0..n {
             let mut datum = sorted_data[i].to_be_bytes();
-//             let a = iter.next();
-//             let b = Some((sorted_strings[i].as_slice(), &mut datum[..]));
-//             if a != b {
-//                 println!("{:?} != {:?}", a, b);
-//                 iter.leaf.as_ref().map(|(l, c)| {
-//                     let leaf = l.as_leaf();
-//                     for i in 0..l.len() {
-//                         println!("{:?}", leaf.key_at(i).unwrap());
-//                     }
-//                     println!("sorted {:?}", leaf.is_sorted());
-//                 });
-//                 panic!("wrong");
-//             }
             assert_eq!(iter.next(), Some((sorted_strings[i].as_slice(), &mut datum[..])));
-            // println!("n: {}", i);
         }
         assert_eq!(iter.next(), None);
 

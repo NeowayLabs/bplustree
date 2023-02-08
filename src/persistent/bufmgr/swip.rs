@@ -1,9 +1,8 @@
 use std::fmt;
 use crate::error;
 
-const COOL_BIT: u64 =        0b0000000000000000000000000000000000000000000000000000000000000010;
 const UNSWIZZLED_BIT: u64 =  0b0000000000000000000000000000000000000000000000000000000000000001;
-const HOT_MASK: u64 =        0b1111111111111111111111111111111111111111111111111111111111111100;
+const HOT_MASK: u64 =        0b1111111111111111111111111111111111111111111111111111111111111110;
 const SIZE_CLASS_MASK: u64 = 0b0000000000000000000000000000000000000000000000000000000001111110;
 const PAGE_ID_MASK: u64 =    0b1111111111111111111111111111111111111111111111111111111110000000;
 
@@ -34,6 +33,11 @@ impl Pid {
     }
 
     #[inline]
+    pub fn is_invalid(&self) -> bool {
+        self.page_id() == 2u64.pow(57) - 1
+    }
+
+    #[inline]
     pub fn size_class(&self) -> u8 {
         ((self.0 & SIZE_CLASS_MASK) >> 1) as u8
     }
@@ -51,7 +55,6 @@ impl fmt::Debug for Pid {
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub enum RefOrPid<T: 'static> {
     Ref(&'static T),
-    Cool(&'static T),
     Pid(Pid)
 }
 
@@ -77,11 +80,6 @@ impl<T: fmt::Debug> fmt::Debug for Swip<T> {
                     .field("r", &r)
                     .finish()
             }
-            RefOrPid::Cool(r) => {
-                f.debug_struct("Swip")
-                    .field("cool", &r)
-                    .finish()
-            }
             RefOrPid::Pid(pid) => {
                 f.debug_struct("Swip")
                     .field("pid", &pid)
@@ -104,11 +102,6 @@ impl<T: 'static> Swip<T> {
     }
 
     #[inline]
-    pub fn from_cool(r: &'static T) -> Self {
-        Swip { raw: (r as *const T as u64) | COOL_BIT }
-    }
-
-    #[inline]
     pub fn from_pid(pid: Pid) -> Self {
         Swip { pid }
     }
@@ -117,8 +110,6 @@ impl<T: 'static> Swip<T> {
     pub fn downcast(&self) -> RefOrPid<T> {
         if unsafe { self.raw } & UNSWIZZLED_BIT == 1 {
             RefOrPid::Pid(unsafe { self.pid })
-        } else if unsafe { self.raw } & COOL_BIT == 2 {
-            RefOrPid::Cool(unsafe { &*((self.raw & HOT_MASK) as *const T) })
         } else {
             RefOrPid::Ref(unsafe { self.r })
         }
@@ -164,31 +155,17 @@ impl<T: 'static> Swip<T> {
     }
 
     #[inline]
-    pub fn to_cool(&mut self, r: &'static T) {
-        unsafe { self.raw = (r as *const T as u64) | COOL_BIT };
-    }
-
-    #[inline]
     pub fn to_pid(&mut self, pid: Pid) {
         unsafe { self.pid = pid };
     }
 
     pub fn is_ref(&self) -> bool {
-        !self.invalid() && unsafe { self.raw & (UNSWIZZLED_BIT | COOL_BIT) == 0 }
-    }
-
-    pub fn is_cool(&self) -> bool {
-        unsafe { self.raw & (UNSWIZZLED_BIT | COOL_BIT) == 2 }
+        !self.invalid() && unsafe { self.raw & UNSWIZZLED_BIT == 0 }
     }
 
     pub fn is_pid(&self) -> bool {
-        unsafe { self.raw & (UNSWIZZLED_BIT | COOL_BIT) == 1 }
+        unsafe { self.raw & UNSWIZZLED_BIT == 1 }
     }
-
-//     #[inline]
-//     pub fn swizzled(&self) -> bool {
-//         !self.invalid() && (unsafe { self.raw } & UNSWIZZLED_BIT == 0u64)
-//     }
 }
 
 

@@ -22,8 +22,6 @@ use std::borrow::Borrow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fmt;
 
-// use parking_lot_core::SpinWait;
-
 pub mod error;
 pub mod latch;
 pub mod iter;
